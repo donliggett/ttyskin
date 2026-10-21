@@ -48,6 +48,7 @@ aside h3:first-child { margin-top: 4px; }
 #brushChar { width: 46px; text-align: center; font-size: 16px; }
 #missing { color: var(--warn); white-space: pre-wrap; }
 .note { color: var(--dim); font-size: 12px; }
+.samples label { color: var(--dim); } .samples input { padding: 2px 6px; }
 footer { display: flex; gap: 18px; padding: 4px 12px; background: var(--panel); border-top: 1px solid var(--line); color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; }
 footer #msg { color: var(--accent2); overflow: hidden; text-overflow: ellipsis; }
 footer #msg.err { color: var(--warn); }
@@ -111,6 +112,23 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-si
       </select>
       <input type="number" id="cols" min="20" max="512" title="columns"> × <input type="number" id="rows" min="5" max="200" title="rows">
     </div>
+
+    <h3>Sample values</h3>
+    <div class="row samples">
+      <label title="{host}">host <input id="smpHost" size="12"></label>
+      <label title="{tty}">tty <input id="smpTty" size="5"></label>
+      <label title="{users}">users <input id="smpUsers" size="2"></label>
+    </div>
+    <div class="row samples">
+      <label title="{os}">os <input id="smpOs" size="22"></label>
+    </div>
+    <div class="row samples">
+      <label title="{ipv4} and {ipv4:interface}">ipv4 <input id="smpIp" size="15"></label>
+    </div>
+    <div class="row samples">
+      <label title="per interface, like eth0=192.168.1.20, tailscale0=100.64.0.1">by interface <input id="smpIfs" size="24" placeholder="eth0=192.168.1.20"></label>
+    </div>
+    <p class="note">What live values show as in this page, so rows line up as they will on your machine.</p>
 
     <h3>Tool</h3>
     <div class="row">
@@ -188,11 +206,12 @@ const S = {
   tool: "brush", brush: { ch: "█", fg: 7, bg: null, mode: "both" },
   sel: null, drag: null, cursor: null, clip: null, hover: null,
   layout: null,
+  samples: { host: "myhost", tty: "tty1", users: "1", os: "Linux", ip: "192.168.1.20", ifs: "" },
 };
 const $ = id => document.getElementById(id);
 const prefs = {
   load() { try { return JSON.parse(localStorage.getItem("ttyskin") || "{}"); } catch (e) { return {}; } },
-  save() { try { localStorage.setItem("ttyskin", JSON.stringify({ cols: S.cols, rows: S.rows, zoom: S.zoom, view: S.view, brush: S.brush })); } catch (e) {} },
+  save() { try { localStorage.setItem("ttyskin", JSON.stringify({ cols: S.cols, rows: S.rows, zoom: S.zoom, view: S.view, brush: S.brush, samples: S.samples })); } catch (e) {} },
 };
 
 function msg(text, err) { const m = $("msg"); m.textContent = text || ""; m.className = err ? "err" : ""; }
@@ -426,15 +445,18 @@ function hexRgb(h) { return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5)
 function viewPalette() { const p = cur(); return S.view.palette === "piece" && p && p.palette ? p.palette : PALETTES[S.view.palette === "piece" ? "linux" : S.view.palette]; }
 
 function sampleValue(kind, arg) {
-  const now = new Date();
+  const now = new Date(), v = S.samples;
   switch (kind) {
-    case "host": return "myhost";
-    case "ipv4": return "192.168.1.20";
+    case "host": return v.host;
+    case "ipv4": {
+      if (arg) for (const pair of v.ifs.split(",")) { const [k, a] = pair.split("=").map(x => x && x.trim()); if (k === arg && a) return a; }
+      return v.ip;
+    }
     case "date": return now.toDateString();
     case "time": return now.toTimeString().slice(0, 8);
-    case "users": return "1";
-    case "tty": return "tty1";
-    case "os": return "Linux";
+    case "users": return v.users;
+    case "tty": return v.tty;
+    case "os": return v.os;
   }
   return "?";
 }
@@ -444,7 +466,7 @@ function buildScreen() {
   const p = cur(), g = p.grid, rows = [];
   const text = (s, fg) => [...s].map(ch => ({ ch, fg, bg: -1, gr: -1, gc: -1 }));
   let artTop = 0;
-  if (S.view.frame && S.view.distro) { rows.push(text("Linux 6.x myhost tty1", -1)); rows.push([]); }
+  if (S.view.frame && S.view.distro) { rows.push(text(`${S.samples.os} ${S.samples.host} ${S.samples.tty}`, -1)); rows.push([]); }
   artTop = rows.length;
   const box = contentBox(g);
   // art alone: the art plus room around it to keep drawing
@@ -475,7 +497,7 @@ function buildScreen() {
   if (S.view.frame) {
     let last = artTop + artRows - 1; while (last >= artTop && rows[last].every(x => x.ch === " " && x.bg < 0)) last--;
     rows.length = Math.max(last + 1, artTop);
-    rows.push(text("myhost login: ", -1).concat([{ ch: "_", fg: -1, bg: -1, gr: -1, gc: -1 }]));
+    rows.push(text(S.samples.host + " login: ", -1).concat([{ ch: "_", fg: -1, bg: -1, gr: -1, gc: -1 }]));
   }
   const H = S.view.frame ? S.rows : rows.length, W = artCols;
   S.layout = { artTop, W, H, live: S.view.live, editH: S.view.frame ? editRows() : artRows };
@@ -818,6 +840,10 @@ function bind() {
   $("viewPalette").onchange = e => { S.view.palette = e.target.value; prefs.save(); renderAll(); };
   $("zoom").onchange = e => { S.zoom = e.target.value; prefs.save(); applyZoom(); drawOverlay(); };
   for (const k of ["frame", "distro", "grid", "live"]) $(k).onchange = e => { S.view[k] = e.target.checked; prefs.save(); renderAll(); };
+  for (const [id, key] of [["smpHost", "host"], ["smpTty", "tty"], ["smpUsers", "users"], ["smpOs", "os"], ["smpIp", "ip"], ["smpIfs", "ifs"]]) {
+    $(id).value = S.samples[key];
+    $(id).oninput = e => { S.samples[key] = e.target.value; prefs.save(); if (cur()) drawScreen(); };
+  }
   $("sizePreset").onchange = e => { if (e.target.value !== "custom") { const [c, r] = e.target.value.split("x").map(Number); setSize(c, r); } };
   $("cols").onchange = () => setSize($("cols").value, S.rows); $("rows").onchange = () => setSize(S.cols, $("rows").value);
   for (const b of document.querySelectorAll("[data-tool]")) b.onclick = () => setTool(b.dataset.tool);
@@ -897,6 +923,7 @@ function init() {
   if (pr.view) Object.assign(S.view, pr.view);
   if (pr.brush) Object.assign(S.brush, pr.brush);
   if (pr.zoom) S.zoom = pr.zoom;
+  if (pr.samples) Object.assign(S.samples, pr.samples);
   $("viewPalette").value = S.view.palette; $("zoom").value = S.zoom;
   for (const k of ["frame", "distro", "grid", "live"]) $(k).checked = S.view[k];
   bind(); renderGlyphs();

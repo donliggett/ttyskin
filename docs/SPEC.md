@@ -1,6 +1,6 @@
 # ttyskin: specification
 
-Status: version 0.1, built and checked on a real console (§6).
+Status: version 0.2, built and checked on a real console (§6).
 
 ttyskin puts colour text art on the Linux login console (the text screen a machine shows after boot, before anyone logs in) and lets you switch between pieces of art. It has two parts:
 
@@ -12,7 +12,7 @@ ttyskin puts colour text art on the Linux login console (the text screen a machi
 - **Art:** the login prompt (`agetty`, util-linux 2.36 or newer) prints `/etc/issue` and then every file in `/etc/issue.d/`. ttyskin writes one file there, `/etc/issue.d/ttyskin.issue`, and never edits `/etc/issue`.
 - **Colour:** the issue file carries colour escape sequences (`\e[...m`, which agetty turns into the escape character). The console shows 16 colours for text and 8 for backgrounds. Bright text (slots 8–15) is written as bold plus the base colour (`1;3x`), which the Linux console shows as the bright colour.
 - **Palette:** the 16 colours themselves can be redefined. ttyskin sets them with `setvtrgb` and keeps them across reboots with its own boot unit, `ttyskin-palette.service`, which runs after the distribution's own palette unit. The palette applies to the whole console, not only to the art.
-- **Redraw:** after a change, ttyskin runs `agetty --reload` so the running login prompts redraw; no reboot. If that fails, the change shows the next time the prompt is drawn.
+- **Redraw:** after a change, ttyskin clears every virtual console that is waiting at a login prompt (an active `getty@`/`autovt@` unit whose terminal has no one logged in, per `who`), then runs `agetty --reload` so the prompts redraw from the top; no reboot. Consoles where someone is logged in are never cleared. Login prompts start with `--noclear` on many distributions, which is why ttyskin clears them itself. If the reload fails, the change shows the next time the prompt is drawn.
 - **Live values:** the issue file can include values the login prompt fills in each time it draws: host name, an interface's IPv4 address, date, time, logged-in users, the terminal's name, the OS name.
 
 ## 2. A piece
@@ -82,6 +82,7 @@ Requires Python 3.8 or newer (standard library only), util-linux `agetty` 2.36+,
   - Live values: insert one at the text cursor.
   - Every character in the font, to paint with or type at the cursor.
 - **Check:** characters the font lacks are outlined in red and listed, with width against the console, tabs and text in braces that isn't a live value.
+- **Sample values:** the host name, IPv4 address (with per-interface values, like `tailscale0=100.64.0.1`), OS name, terminal and user count the page shows for live values; date and time come from the clock. They are kept in the browser between visits.
 - **Font:** the page includes the 8×16 Uni2 Fixed console font. **Font…** loads another: a `ttyskin font export` file, or a `.psf` / `.psf.gz` directly.
 - **Console size:** presets (80×25, 160×50, 240×67, 320×90) or columns and rows typed in.
 
@@ -114,4 +115,4 @@ On a real console (Ubuntu 26.04, util-linux 2.41.3, systemd 259, 2560×1440 fram
 - `setvtrgb` run from an SSH session changes the console's palette straight away.
 - The palette survives a reboot: `ttyskin-palette.service` runs right after the distribution's `setvtrgb.service`.
 
-Not checked: whether `9x` (`TTYSKIN_BRIGHT=aixterm`) also works on the Linux console.
+Not checked: whether `9x` (`TTYSKIN_BRIGHT=aixterm`) also works on the Linux console; clearing waiting consoles before the redraw (new in 0.2).

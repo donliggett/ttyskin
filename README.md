@@ -20,7 +20,7 @@ ttyskin puts color text art on the Linux login console: the text screen a machin
 - Color comes from standard escape sequences in that file: 16 colors for text, 8 for backgrounds.
 - A piece can also bring its own palette: the 16 colors themselves. ttyskin sets them with `setvtrgb`, and a small boot unit keeps them across reboots. A palette applies to the whole console, not only to the art.
 - Art can include live values that the login prompt fills in each time it draws: host name, IP address, date, time, logged-in users, terminal name, OS name.
-- After a change, ttyskin asks the login prompts to redraw, so there is no reboot.
+- After a change, ttyskin clears the consoles waiting at a login prompt and asks the prompts to redraw, so the art appears at the top straight away, with no reboot. A console where someone is logged in is never cleared.
 
 ## Requirements
 
@@ -113,6 +113,7 @@ Open `ttyskin.html` in a browser. It works from disk with no server and no netwo
 - **Open read-only** (any browser): view and edit; **Download** saves the piece as a `.zip`.
 - **View:** the piece's palette or a default one, the whole console with its login prompt or the art alone, a grid, and live values filled in with samples. `←` and `→` flip between pieces.
 - **Edit:** a brush (right-click erases, Alt+click picks), text, selections you can move, copy and paste, undo, a palette editor, and every character the font has. Characters the font lacks are outlined in red.
+- **Sample values:** what live values show as in the page (host name, addresses, OS, terminal, users), so rows with live values line up as they will on your machine.
 - **Font:** the page includes the common 8×16 console font. `ttyskin font export -o font.json` on a machine writes that machine's font for **Font…**.
 
 ## Uninstall

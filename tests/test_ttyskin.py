@@ -275,6 +275,22 @@ class TestUseOff(Base):
         self.assertIn("  a", out)
 
 
+class TestConsoles(unittest.TestCase):
+    UNITS = ("getty@tty1.service loaded active running Getty on tty1\n"
+             "autovt@tty2.service loaded active running Getty on tty2\n"
+             "getty@tty10.service loaded active running Getty on tty10\n")
+
+    def test_idle_skips_logged_in(self):
+        who = "adonis   tty1         2026-10-20 17:55\nadonis   pts/0        2026-10-20 17:38 (100.85.8.85)\n"
+        self.assertEqual(T.idle_consoles(self.UNITS, who), ["tty2", "tty10"])
+
+    def test_idle_none_logged_in(self):
+        self.assertEqual(T.idle_consoles(self.UNITS, ""), ["tty1", "tty2", "tty10"])
+
+    def test_no_consoles(self):
+        self.assertEqual(T.idle_consoles("", ""), [])
+
+
 class TestSample(unittest.TestCase):
     def test_sample_piece_passes(self):
         p = T.Piece(os.path.join(HERE, "..", "pieces"), "sample")

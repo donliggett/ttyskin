@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 EXIT_OK, EXIT_CHECK, EXIT_USAGE, EXIT_ROOT, EXIT_MISSING, EXIT_IN_THE_WAY = 0, 1, 2, 3, 4, 5
 
@@ -589,7 +589,53 @@ def issue_is_ours(state):
         return False
 
 
+CLEAR = "\x1b[H\x1b[2J\x1b[3J"
+
+
+def idle_consoles(units_text, who_text):
+    """Virtual consoles with a running login prompt and no one logged in.
+    units_text: `systemctl list-units` output for getty@/autovt@ units;
+    who_text: `who` output."""
+    ttys = re.findall(r"(?:getty|autovt)@(tty\d+)\.service", units_text)
+    busy = {line.split()[1] for line in who_text.splitlines() if len(line.split()) > 1}
+    return sorted(set(t for t in ttys if t not in busy), key=lambda t: int(t[3:]))
+
+
+def find_idle_consoles():
+    if is_test_mode():
+        return None
+    try:
+        units = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active",
+                                "getty@tty*.service", "autovt@tty*.service"],
+                               capture_output=True, text=True).stdout
+        who = subprocess.run(["who"], capture_output=True, text=True).stdout
+    except OSError:
+        return None
+    return idle_consoles(units, who)
+
+
+def clear_consoles(plan):
+    """Wipe the consoles waiting at a login prompt, so the redraw starts at the top.
+    Consoles where someone is logged in are left alone."""
+    ttys = find_idle_consoles()
+    if ttys is None:
+        plan.say("clear the waiting consoles (skipped: can't list them here)")
+        return
+    if not ttys:
+        return
+    plan.say("clear %s (waiting at a login prompt; logged-in consoles are left alone)" % ", ".join(ttys))
+    if plan.dry:
+        return
+    for t in ttys:
+        try:
+            with open("/dev/" + t, "w") as f:
+                f.write(CLEAR)
+        except OSError as e:
+            print("  (couldn't clear %s: %s)" % (t, e))
+
+
 def reload_gettys(plan):
+    clear_consoles(plan)
     if not plan.run(["agetty", "--reload"], ok_fail=True):
         print("  The login prompt will show the change the next time it is drawn "
               "(log out of the console, or reboot).")
