@@ -107,7 +107,7 @@ The full format is in [docs/SPEC.md](docs/SPEC.md).
 
 ## The page
 
-Open `ttyskin.html` in a browser. It works from disk with no server and no network.
+Open `ttyskin.html` in a browser. It works from disk with no server and no network. The [guide](docs/GUIDE.md) walks through making a piece, live values, importing an image and putting the result on a machine.
 
 - **Open folder** (Chrome, Edge): pick a pieces folder, or one piece's folder. **Save** writes back into the piece's files.
 - **Open read-only** (any browser): view and edit; **Download** saves the piece as a `.zip`.

@@ -95,7 +95,7 @@ Requires Python 3.8 or newer (standard library only), util-linux `agetty` 2.36+,
 - **Palette:** *from the image* (the default), *this piece's palette* (when the open piece has one), *Linux default* or *Ubuntu default*.
 - **Characters:** *blocks* (space `█ ░ ▒ ■ ▮`); *blocks and lines*, which adds shapes that carry edges in an 8×16 console font (`─ │ ═ ║ ┼ ├ ┤ ┬ ┴ ┌ ┐ └ ┘ ╭ ╮ ╰ ╯ ╱ ╲ ╳ / \ _ ‗ ¯ · . • ●`); or *every character in the font*, which is slow and warns above 80 columns. Only characters the loaded font has are used, and never `{` or `}`, combining marks or other characters that don't take one cell.
 - **Into:** *a new piece* (named like **New**, with its own folder when a pieces folder is open) or *replace this piece* (one undo restores the art and the palette).
-- Afterwards View shows the piece in the palette it was made for: the piece's palette for *from the image* and *this piece's palette*; *Linux default* or *Ubuntu default* leave the piece without `palette.txt` (the console's own colours) and select that palette in View.
+- The piece keeps the palette its colours were matched against: *from the image*, *Linux default* and *Ubuntu default* write it as the piece's `palette.txt`, so the console shows what the preview showed whatever palette the machine had; *this piece's palette* leaves `palette.txt` as it was. Afterwards View shows the piece in its palette.
 
 How it chooses:
 
@@ -115,6 +115,7 @@ systemd/ttyskin-palette.service  keeps the palette across reboots
 pieces/sample/                   the sample piece
 tests/test_ttyskin.py            the command's tests (python3 -m unittest discover -s tests)
 docs/SPEC.md                     this file
+docs/GUIDE.md                    how to use the page and the command
 README.md                        what it does, install, use
 LICENSE                          MIT; the font's public-domain note
 ```
@@ -123,7 +124,7 @@ Install is a clone and a link: the clone in `/opt/ttyskin`, the command linked i
 
 ## 6. Checked
 
-In development: the command's behaviour against a stand-in root (31 tests, Python 3.13 and 3.14), the page in headless Chromium (rendering, editing, saving into a folder), the default font's licence. The image import (0.3) in headless Chromium and Edge: imports of a logo, a photo and a sprite at 64 to 320 columns pass `ttyskin check`, with no network requests.
+In development: the command's behaviour against a stand-in root (34 tests, Python 3.13 and 3.14), the page in headless Chromium (rendering, editing, saving into a folder), the default font's licence. The image import (0.3) in headless Chromium and Edge: imports of a logo, a photo and a sprite at 64 to 320 columns pass `ttyskin check`, with no network requests.
 
 On a real console (Ubuntu 26.04, util-linux 2.41.3, systemd 259, 2560×1440 framebuffer, 2026-10-20):
 

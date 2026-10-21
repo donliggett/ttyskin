@@ -1081,16 +1081,16 @@ async function applyImport(res, into, name) {
     p = cur(); if (!p) throw new Error("no piece to replace");
     pushUndo(); // one step restores the art and the palette
     p.grid = { w: g.w, h: g.h, ch: g.ch.slice(), fg: g.fg.slice(), bg: g.bg.slice() };
-    if (res.mode === "image") p.palette = res.pal.slice(); else if (res.mode !== "piece") p.palette = null;
+    if (res.mode !== "piece") p.palette = res.pal.slice();  // the colours it was matched against go with it
   } else {
     if (!NAME_RE.test(name || "")) throw new Error("use lowercase letters, digits and dashes");
     if (S.pieces.some(q => q.name === name)) throw new Error(name + " already exists");
     p = makePiece(name, { "art.txt": "" }, null);
     p.grid = { w: g.w, h: g.h, ch: g.ch.slice(), fg: g.fg.slice(), bg: g.bg.slice() };
-    p.palette = res.mode === "image" || res.mode === "piece" ? res.pal.slice() : null;
+    p.palette = res.pal.slice();
   }
   // show it in the palette it was made for
-  S.view.palette = res.mode === "image" || res.mode === "piece" ? "piece" : res.mode; $("viewPalette").value = S.view.palette; prefs.save();
+  S.view.palette = "piece"; $("viewPalette").value = S.view.palette; prefs.save();
   if (into === "replace") afterPieceChange(); else await joinPieces(p);
   msg(`imported ${res.cols}×${res.rows} into ${p.name}` + (into === "replace" ? " (Ctrl+Z restores it)" : p.handle ? " (Save to write it)" : " (Download to keep it)"));
   return p;
