@@ -1,0 +1,6 @@
+# Your own pieces stay out of the repository; only the sample is tracked.
+/pieces/*
+!/pieces/sample/
+
+__pycache__/
+*.pyc

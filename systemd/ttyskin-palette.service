@@ -1,0 +1,16 @@
+[Unit]
+Description=ttyskin console palette
+Documentation=https://github.com/donliggett/ttyskin
+DefaultDependencies=no
+After=systemd-user-sessions.service plymouth-quit-wait.service console-setup.service setvtrgb.service
+Before=system-getty.slice
+ConditionPathExists=/etc/ttyskin/vtrgb
+ConditionPathExists=/dev/tty0
+
+[Service]
+Type=oneshot
+ExecStart=setvtrgb /etc/ttyskin/vtrgb
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

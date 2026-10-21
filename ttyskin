@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""ttyskin: colour text art for the Linux login console.
+
+Installs a piece of art as /etc/issue.d/ttyskin.issue (printed by agetty above
+the login prompt), sets the console's 16-colour palette with setvtrgb, and
+checks pieces against the console's font and size. See docs/SPEC.md.
+"""
+
+import argparse
+import datetime
+import glob
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+
+EXIT_OK, EXIT_CHECK, EXIT_USAGE, EXIT_ROOT, EXIT_MISSING, EXIT_IN_THE_WAY = 0, 1, 2, 3, 4, 5
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+IFACE_RE = r"[A-Za-z0-9_.:@-]+"
+TOKEN_RE = re.compile(r"\{(host|date|time|users|tty|os|ipv4(?::" + IFACE_RE + r")?)\}")
+LOOKS_LIKE_TOKEN_RE = re.compile(r"\{[a-z0-9]+(?::[^{}\s]*)?\}")
+
+# agetty issue-file escapes for each live value.
+TOKEN_ESCAPES = {"host": r"\n", "date": r"\d", "time": r"\t", "users": r"\u",
+                 "tty": r"\l", "os": r"\S"}
+
+AGETTY_MIN = (2, 36)
+
+# ---------------------------------------------------------------- paths
+
+def root_prefix():
+    """TTYSKIN_ROOT, when set, stands in for / (for tests): system paths are
+    read and written under it and no system command is run."""
+    return os.environ.get("TTYSKIN_ROOT", "")
+
+
+def syspath(p):
+    r = root_prefix()
+    return os.path.join(r, p.lstrip("/")) if r else p
+
+
+def issue_file():
+    return syspath("/etc/issue.d/ttyskin.issue")
+
+
+def state_dir():
+    return syspath("/etc/ttyskin")
+
+
+def state_file():
+    return os.path.join(state_dir(), "state.json")
+
+
+def vtrgb_file():
+    return os.path.join(state_dir(), "vtrgb")
+
+
+def saved_vtrgb_file():
+    return os.path.join(state_dir(), "vtrgb.saved")
+
+
+def config_file():
+    return os.path.join(state_dir(), "config")
+
+# ---------------------------------------------------------------- small helpers
+
+class Fail(Exception):
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def write_atomic(path, data, mode=0o644):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, ".%s.tmp" % os.path.basename(path))
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def sha256(data):
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def read_config():
+    cfg = {}
+    try:
+        for line in read_text(config_file()).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def read_state():
+    try:
+        return json.loads(read_text(state_file()))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def is_test_mode():
+    return bool(root_prefix())
+
+# ---------------------------------------------------------------- pieces
+
+def pieces_dir(args):
+    if getattr(args, "dir", None):
+        return args.dir
+    if os.environ.get("TTYSKIN_PIECES"):
+        return os.environ["TTYSKIN_PIECES"]
+    cfg = read_config()
+    if cfg.get("pieces_dir"):
+        return cfg["pieces_dir"]
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "pieces")
+
+
+def list_pieces(pdir):
+    out = []
+    if not os.path.isdir(pdir):
+        return out
+    for name in sorted(os.listdir(pdir)):
+        if os.path.isfile(os.path.join(pdir, name, "art.txt")):
+            out.append(name)
+    return out
+
+
+def read_lines(path):
+    if not os.path.exists(path):
+        return None
+    text = read_text(path).replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+class Piece:
+    def __init__(self, pdir, name):
+        self.name = name
+        self.path = os.path.join(pdir, name)
+        if not os.path.isfile(os.path.join(self.path, "art.txt")):
+            raise Fail("no piece called %r in %s" % (name, pdir), EXIT_USAGE)
+        self.art = read_lines(os.path.join(self.path, "art.txt")) or []
+        self.fg = read_lines(os.path.join(self.path, "fg.txt"))
+        self.bg = read_lines(os.path.join(self.path, "bg.txt"))
+        self.palette_lines = read_lines(os.path.join(self.path, "palette.txt"))
+        self.meta_path = os.path.join(self.path, "piece.json")
+
+    def meta(self):
+        try:
+            m = json.loads(read_text(self.meta_path))
+            return m if isinstance(m, dict) else {}
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def title(self):
+        return self.meta().get("title") or ""
+
+    def palette(self):
+        """The 16 colours as (r, g, b), or None. Raises ValueError if malformed."""
+        if self.palette_lines is None:
+            return None
+        cols = [l.strip() for l in self.palette_lines if l.strip()]
+        if len(cols) != 16 or not all(HEX_RE.match(c) for c in cols):
+            raise ValueError("palette.txt needs 16 lines of #rrggbb")
+        return [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in cols]
+
+    def rows(self):
+        n = max(len(self.art), len(self.fg or []), len(self.bg or []))
+        return n
+
+    def cell_colour(self, layer, r, c):
+        if layer is None or r >= len(layer) or c >= len(layer[r]):
+            return None
+        ch = layer[r][c]
+        if ch in ". ":
+            return None
+        return int(ch, 16) if ch in "0123456789abcdef" else None
+
+    def row_items(self, r):
+        """Yield ('char', col, ch, fg, bg) and ('token', col, text, fg, bg, kind, arg)
+        across the row's full width (art and colour layers)."""
+        art = self.art[r] if r < len(self.art) else ""
+        width = max(len(art),
+                    len(self.fg[r]) if self.fg and r < len(self.fg) else 0,
+                    len(self.bg[r]) if self.bg and r < len(self.bg) else 0)
+        art = art.ljust(width)
+        tokens = {m.start(): m for m in TOKEN_RE.finditer(art)}
+        c = 0
+        while c < width:
+            fg = self.cell_colour(self.fg, r, c)
+            bg = self.cell_colour(self.bg, r, c)
+            m = tokens.get(c)
+            if m:
+                body = m.group(1)
+                kind, _, arg = body.partition(":")
+                yield ("token", c, m.group(0), fg, bg, kind, arg)
+                c = m.end()
+                continue
+            yield ("char", c, art[c], fg, bg)
+            c += 1
+
+# ---------------------------------------------------------------- fonts
+
+def parse_psf(data):
+    """Return (width, height, glyph_bytes_list, {codepoint: glyph_index})."""
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    cmap = {}
+    if data[:2] == b"\x36\x04":
+        mode, charsize = data[2], data[3]
+        n = 512 if mode & 1 else 256
+        width, height = 8, charsize
+        glyphs = [data[4 + i * charsize: 4 + (i + 1) * charsize] for i in range(n)]
+        if mode & 2:
+            pos, idx = 4 + n * charsize, 0
+            in_seq = False
+            while pos + 1 < len(data) and idx < n:
+                u = data[pos] | (data[pos + 1] << 8)
+                pos += 2
+                if u == 0xFFFF:
+                    idx += 1
+                    in_seq = False
+                elif u == 0xFFFE:
+                    in_seq = True
+                elif not in_seq:
+                    cmap.setdefault(u, idx)
+        else:
+            cmap = {i: i for i in range(n)}
+        return width, height, glyphs, cmap
+    if data[:4] == b"\x72\xb5\x4a\x86":
+        hsize, flags, n, charsize, height, width = [int.from_bytes(data[o:o + 4], "little") for o in range(8, 32, 4)]
+        glyphs = [data[hsize + i * charsize: hsize + (i + 1) * charsize] for i in range(n)]
+        if flags & 1:
+            tab = data[hsize + n * charsize:]
+            idx, pos = 0, 0
+            while pos < len(tab) and idx < n:
+                end = tab.find(b"\xff", pos)
+                if end < 0:
+                    break
+                entry = tab[pos:end]
+                main = entry.split(b"\xfe")[0]
+                for ch in main.decode("utf-8", "ignore"):
+                    cmap.setdefault(ord(ch), idx)
+                idx += 1
+                pos = end + 1
+        else:
+            cmap = {i: i for i in range(n)}
+        return width, height, glyphs, cmap
+    raise ValueError("not a PSF font")
+
+
+class Font:
+    def __init__(self, path):
+        self.path = path
+        if path.endswith(".json"):
+            d = json.loads(read_text(path))
+            self.width, self.height = d["width"], d["height"]
+            self.glyphs = [bytes.fromhex(g) for g in d["glyphs"]]
+            self.map = {int(k): v for k, v in d["map"].items()}
+        else:
+            with open(path, "rb") as f:
+                self.width, self.height, self.glyphs, self.map = parse_psf(f.read())
+
+    def has(self, ch):
+        return ord(ch) in self.map
+
+    def to_json(self, name):
+        return {"format": "ttyskin-font/1", "name": name,
+                "width": self.width, "height": self.height,
+                "glyphs": [g.hex() for g in self.glyphs],
+                "map": {str(k): v for k, v in sorted(self.map.items())}}
+
+
+def default_font_path():
+    found = glob.glob(syspath("/etc/console-setup/cached_*.psf.gz")) + \
+        glob.glob(syspath("/etc/console-setup/cached_*.psf"))
+    if found:
+        return max(found, key=os.path.getmtime)
+    return None
+
+
+def load_font(args):
+    path = getattr(args, "font", None) or read_config().get("font") or default_font_path()
+    if not path:
+        return None
+    try:
+        return Font(path)
+    except (OSError, ValueError, KeyError) as e:
+        raise Fail("can't read the font %s: %s" % (path, e), EXIT_MISSING)
+
+
+def console_size(args, font):
+    s = getattr(args, "size", None) or read_config().get("size")
+    if s:
+        m = re.match(r"^(\d+)x(\d+)$", s)
+        if not m:
+            raise Fail("--size takes COLUMNSxROWS, like 160x50", EXIT_USAGE)
+        return int(m.group(1)), int(m.group(2))
+    if font is None:
+        return None
+    try:
+        w, h = read_text(syspath("/sys/class/graphics/fb0/virtual_size")).strip().split(",")
+        return int(w) // font.width, int(h) // font.height
+    except (OSError, ValueError):
+        return None
+
+# ---------------------------------------------------------------- check
+
+def check_piece(piece, font, size):
+    """Return (errors, warnings), each a list of strings."""
+    errors, warnings = [], []
+    if not NAME_RE.match(piece.name):
+        errors.append("name: use lowercase letters, digits and dashes (%r)" % piece.name)
+    for r, line in enumerate(piece.art):
+        for c, ch in enumerate(line):
+            if ch == "\t":
+                errors.append("art.txt %d:%d: a tab; use spaces" % (r + 1, c + 1))
+            elif ord(ch) < 32 or ord(ch) == 127:
+                errors.append("art.txt %d:%d: a control character (U+%04X)" % (r + 1, c + 1, ord(ch)))
+        for m in LOOKS_LIKE_TOKEN_RE.finditer(line):
+            if not TOKEN_RE.fullmatch(m.group(0)):
+                warnings.append("art.txt %d:%d: %s is not a live value; it is drawn as written"
+                                % (r + 1, m.start() + 1, m.group(0)))
+    for fname, layer, allowed in (("fg.txt", piece.fg, "0123456789abcdef. "),
+                                  ("bg.txt", piece.bg, "01234567. ")):
+        if layer is None:
+            continue
+        for r, line in enumerate(layer):
+            for c, ch in enumerate(line):
+                if ch not in allowed:
+                    errors.append("%s %d:%d: %r is not a colour (%s)" % (
+                        fname, r + 1, c + 1, ch,
+                        "0-f or ." if fname == "fg.txt" else "0-7 or .; backgrounds have 8 colours"))
+    try:
+        piece.palette()
+    except ValueError as e:
+        errors.append("palette.txt: %s" % e)
+    if os.path.exists(piece.meta_path):
+        try:
+            if not isinstance(json.loads(read_text(piece.meta_path)), dict):
+                errors.append("piece.json: must be a JSON object")
+        except ValueError as e:
+            errors.append("piece.json: %s" % e)
+    width = 0
+    missing = {}
+    for r in range(piece.rows()):
+        for item in piece.row_items(r):
+            if item[0] == "char":
+                ch = item[2]
+                if font is not None and ch != " " and not font.has(ch):
+                    missing.setdefault(ch, "%d:%d" % (r + 1, item[1] + 1))
+                width = max(width, item[1] + 1 if ch != " " or item[4] is not None else width)
+            else:
+                width = max(width, item[1] + len(item[2]))
+    for ch, where in missing.items():
+        errors.append("art.txt %s: %r (U+%04X) is not in the console font" % (where, ch, ord(ch)))
+    if font is None:
+        warnings.append("characters not checked: no console font found (use --font)")
+    if size:
+        cols, rows = size
+        if width > cols:
+            errors.append("%d columns wide; the console has %d" % (width, cols))
+        if piece.rows() + 4 > rows:
+            warnings.append("%d rows plus the login prompt may not fit the console's %d rows"
+                            % (piece.rows(), rows))
+    else:
+        warnings.append("size not checked: console size unknown (use --size)")
+    if any(i[0] == "token" for r in range(piece.rows()) for i in piece.row_items(r)):
+        warnings.append("live values change length; leave room after each")
+    return errors, warnings
+
+# ---------------------------------------------------------------- rendering
+
+def sgr_16(fg, bg):
+    parts = ["0"]
+    if fg is not None:
+        if fg >= 8:
+            if os.environ.get("TTYSKIN_BRIGHT") == "aixterm":
+                parts.append(str(90 + fg - 8))
+            else:
+                parts += ["1", str(30 + fg - 8)]
+        else:
+            parts.append(str(30 + fg))
+    if bg is not None:
+        parts.append(str(40 + bg))
+    return ";".join(parts)
+
+
+def render(piece, esc, sgr, token_text):
+    """Shared row walker. esc(s) escapes literal text, sgr(fg, bg) returns an
+    escape sequence, token_text(kind, arg) returns what replaces a token."""
+    out = []
+    for r in range(piece.rows()):
+        items = list(piece.row_items(r))
+        # drop trailing plain spaces
+        while items and items[-1][0] == "char" and items[-1][2] == " " and items[-1][4] is None:
+            items.pop()
+        cur = (None, None)
+        line = []
+        for it in items:
+            fg, bg = it[3], it[4]
+            if it[0] == "char" and it[2] == " " and bg == cur[1]:
+                line.append(" ")
+                continue
+            if (fg, bg) != cur:
+                line.append(sgr(fg, bg))
+                cur = (fg, bg)
+            if it[0] == "char":
+                line.append(esc(it[2]))
+            else:
+                line.append(token_text(it[5], it[6]))
+        if cur != (None, None):
+            line.append(sgr(None, None))
+        out.append("".join(line))
+    return "\n".join(out) + "\n"
+
+
+def to_issue(piece):
+    def esc(ch):
+        return "\\\\" if ch == "\\" else ch
+
+    def sgr(fg, bg):
+        return "\\e[" + sgr_16(fg, bg) + "m"
+
+    def tok(kind, arg):
+        if kind == "ipv4":
+            return "\\4{%s}" % arg if arg else "\\4"
+        return TOKEN_ESCAPES[kind]
+    return render(piece, esc, sgr, tok)
+
+
+def local_value(kind, arg):
+    try:
+        if kind == "host":
+            return socket.gethostname().split(".")[0]
+        if kind == "date":
+            return datetime.datetime.now().strftime("%a %b %d %Y")
+        if kind == "time":
+            return datetime.datetime.now().strftime("%H:%M:%S")
+        if kind == "users":
+            out = subprocess.run(["who"], capture_output=True, text=True).stdout
+            return str(len([l for l in out.splitlines() if l.strip()]))
+        if kind == "tty":
+            return os.path.basename(os.ttyname(0))
+        if kind == "os":
+            for line in read_text("/etc/os-release").splitlines():
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip('"')
+        if kind == "ipv4":
+            cmd = ["ip", "-4", "-o", "addr", "show"] + (["dev", arg] if arg else ["scope", "global"])
+            out = subprocess.run(cmd, capture_output=True, text=True).stdout.split()
+            if "inet" in out:
+                return out[out.index("inet") + 1].split("/")[0]
+    except (OSError, ValueError):
+        pass
+    return "?"
+
+
+def to_terminal(piece, truecolor):
+    pal = None
+    try:
+        pal = piece.palette()
+    except ValueError:
+        pass
+
+    def sgr(fg, bg):
+        if pal and truecolor:
+            parts = ["0"]
+            if fg is not None:
+                parts.append("38;2;%d;%d;%d" % pal[fg])
+            if bg is not None:
+                parts.append("48;2;%d;%d;%d" % pal[bg])
+            return "\x1b[" + ";".join(parts) + "m"
+        return "\x1b[" + sgr_16(fg, bg) + "m"
+    return render(piece, lambda ch: ch, sgr, local_value)
+
+# ---------------------------------------------------------------- palette
+
+def palette_to_vtrgb(pal):
+    return "\n".join(",".join(str(c[i]) for c in pal) for i in range(3)) + "\n"
+
+
+def current_vtrgb():
+    try:
+        rows = [read_text(syspath("/sys/module/vt/parameters/default_" + c)).strip()
+                for c in ("red", "grn", "blu")]
+        return "\n".join(rows) + "\n"
+    except OSError:
+        pass
+    try:
+        return read_text(syspath("/etc/vtrgb"))
+    except OSError:
+        return None
+
+# ---------------------------------------------------------------- actions
+
+class Plan:
+    def __init__(self, dry):
+        self.dry = dry
+
+    def say(self, msg):
+        print(("would " if self.dry else "") + msg)
+
+    def write(self, path, data):
+        self.say("write %s (%d bytes)" % (path, len(data.encode("utf-8"))))
+        if not self.dry:
+            write_atomic(path, data)
+
+    def remove(self, path):
+        if os.path.exists(path):
+            self.say("remove %s" % path)
+            if not self.dry:
+                os.remove(path)
+
+    def run(self, cmd, ok_fail=False):
+        self.say("run: %s" % " ".join(cmd))
+        if self.dry or is_test_mode():
+            return True
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout).strip()
+            if ok_fail:
+                print("  (it failed: %s)" % msg)
+                return False
+            raise Fail("%s failed: %s" % (cmd[0], msg), EXIT_MISSING)
+        return True
+
+
+def need_root(dry):
+    if dry or is_test_mode():
+        return
+    if os.geteuid() != 0:
+        raise Fail("this changes system files; run it with sudo", EXIT_ROOT)
+
+
+def agetty_ok():
+    if is_test_mode():
+        return
+    exe = shutil.which("agetty") or "/sbin/agetty"
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        raise Fail("agetty not found; ttyskin needs util-linux agetty %d.%d or newer" % AGETTY_MIN, EXIT_MISSING)
+    m = re.search(r"(\d+)\.(\d+)", out)
+    if not m or (int(m.group(1)), int(m.group(2))) < AGETTY_MIN:
+        raise Fail("agetty is too old (%s); ttyskin needs %d.%d or newer"
+                   % (out.strip(), AGETTY_MIN[0], AGETTY_MIN[1]), EXIT_MISSING)
+
+
+def setvtrgb_cmd():
+    if is_test_mode():
+        return "setvtrgb"
+    exe = shutil.which("setvtrgb") or next(
+        (p for p in ("/usr/sbin/setvtrgb", "/sbin/setvtrgb", "/usr/bin/setvtrgb") if os.path.exists(p)), None)
+    if not exe:
+        raise Fail("setvtrgb not found (it is in the kbd package); needed for palettes", EXIT_MISSING)
+    return exe
+
+
+def issue_is_ours(state):
+    p = issue_file()
+    if not os.path.exists(p):
+        return True
+    try:
+        return sha256(read_text(p)) == state.get("issue_sha256")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def reload_gettys(plan):
+    if not plan.run(["agetty", "--reload"], ok_fail=True):
+        print("  The login prompt will show the change the next time it is drawn "
+              "(log out of the console, or reboot).")
+
+
+def cmd_use(args):
+    need_root(args.dry_run)
+    agetty_ok()
+    piece = Piece(pieces_dir(args), args.name)
+    font = load_font(args)
+    errors, warnings = check_piece(piece, font, console_size(args, font))
+    for w in warnings:
+        print("warning: " + w)
+    if errors:
+        for e in errors:
+            print("error: " + e)
+        raise Fail("%s has %d problem(s); nothing changed" % (piece.name, len(errors)), EXIT_CHECK)
+    state = read_state()
+    if not args.force and not issue_is_ours(state):
+        raise Fail("%s exists and ttyskin didn't write it; move it or use --force" % issue_file(),
+                   EXIT_IN_THE_WAY)
+    pal = piece.palette()
+    # everything the change needs is checked before anything is written
+    exe = setvtrgb_cmd() if (pal or os.path.exists(vtrgb_file())) else None
+    plan = Plan(args.dry_run)
+    issue = to_issue(piece)
+    plan.write(issue_file(), issue)
+    if pal:
+        if not os.path.exists(saved_vtrgb_file()):
+            saved = current_vtrgb()
+            if saved:
+                plan.write(saved_vtrgb_file(), saved)
+        plan.write(vtrgb_file(), palette_to_vtrgb(pal))
+        plan.run([exe, vtrgb_file()])
+    elif os.path.exists(vtrgb_file()):
+        if os.path.exists(saved_vtrgb_file()):
+            plan.run([exe, saved_vtrgb_file()])
+        plan.remove(vtrgb_file())
+    plan.write(state_file(), json.dumps({
+        "piece": piece.name, "from": os.path.abspath(piece.path),
+        "issue_sha256": sha256(issue), "palette": bool(pal),
+        "at": datetime.datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
+    reload_gettys(plan)
+    if not plan.dry:
+        print("%s is in use." % piece.name)
+    return EXIT_OK
+
+
+def cmd_off(args):
+    need_root(args.dry_run)
+    state = read_state()
+    exe = setvtrgb_cmd() if os.path.exists(vtrgb_file()) else None
+    plan = Plan(args.dry_run)
+    if os.path.exists(issue_file()):
+        if not args.force and not issue_is_ours(state):
+            raise Fail("%s wasn't written by ttyskin; leaving it (use --force)" % issue_file(), EXIT_IN_THE_WAY)
+        plan.remove(issue_file())
+    if exe:
+        if os.path.exists(saved_vtrgb_file()):
+            plan.run([exe, saved_vtrgb_file()])
+        plan.remove(vtrgb_file())
+    plan.remove(saved_vtrgb_file())
+    plan.remove(state_file())
+    reload_gettys(plan)
+    if not plan.dry:
+        print("ttyskin is off.")
+    return EXIT_OK
+
+
+def cmd_list(args):
+    pdir = pieces_dir(args)
+    current = read_state().get("piece")
+    names = list_pieces(pdir)
+    if not names:
+        print("no pieces in %s" % pdir)
+        return EXIT_OK
+    for n in names:
+        try:
+            t = Piece(pdir, n).title()
+        except Fail:
+            t = ""
+        print("%s %-24s %s" % ("*" if n == current else " ", n, t))
+    return EXIT_OK
+
+
+def cmd_show(args):
+    piece = Piece(pieces_dir(args), args.name)
+    if args.issue:
+        sys.stdout.write(to_issue(piece))
+    else:
+        truecolor = os.environ.get("COLORTERM", "") in ("truecolor", "24bit")
+        sys.stdout.write(to_terminal(piece, truecolor) + "\x1b[0m")
+    return EXIT_OK
+
+
+def cmd_check(args):
+    piece = Piece(pieces_dir(args), args.name)
+    font = load_font(args)
+    size = console_size(args, font)
+    errors, warnings = check_piece(piece, font, size)
+    for e in errors:
+        print("error: " + e)
+    for w in warnings:
+        print("warning: " + w)
+    if not errors:
+        detail = []
+        if font:
+            detail.append("font %s" % font.path)
+        if size:
+            detail.append("console %dx%d" % size)
+        print("%s is fine%s." % (piece.name, " (" + ", ".join(detail) + ")" if detail else ""))
+    return EXIT_CHECK if errors else EXIT_OK
+
+
+def cmd_status(args):
+    state = read_state()
+    print("piece:      %s" % (state.get("piece") or "none"))
+    if state.get("from"):
+        print("from:       %s" % state["from"])
+    p = issue_file()
+    if os.path.exists(p):
+        print("art:        %s (%s)" % (p, "written by ttyskin" if issue_is_ours(state) else "NOT written by ttyskin"))
+    else:
+        print("art:        none")
+    print("palette:    %s" % (vtrgb_file() if os.path.exists(vtrgb_file()) else "the console's own"))
+    print("saved:      %s" % (saved_vtrgb_file() if os.path.exists(saved_vtrgb_file()) else "none"))
+    if not is_test_mode() and shutil.which("systemctl"):
+        r = subprocess.run(["systemctl", "is-enabled", "ttyskin-palette.service"], capture_output=True, text=True)
+        print("boot unit:  ttyskin-palette.service %s" % (r.stdout.strip() or "not installed"))
+    print("pieces:     %s" % pieces_dir(args))
+    try:
+        font = load_font(args)
+    except Fail:
+        font = None
+    print("font:       %s" % (font.path if font else "not found"))
+    size = console_size(args, font)
+    print("console:    %s" % ("%dx%d" % size if size else "unknown"))
+    return EXIT_OK
+
+
+def cmd_font_export(args):
+    path = args.psf or getattr(args, "font", None) or default_font_path()
+    if not path:
+        raise Fail("no console font found; give one with --psf", EXIT_MISSING)
+    font = Font(path)
+    name = re.sub(r"\.psf(\.gz)?$", "", os.path.basename(path)).replace("cached_", "")
+    data = json.dumps(font.to_json(name), separators=(",", ":")) + "\n"
+    if args.output:
+        write_atomic(args.output, data)
+        print("wrote %s (%d glyphs, %dx%d)" % (args.output, len(font.glyphs), font.width, font.height))
+    else:
+        sys.stdout.write(data)
+    return EXIT_OK
+
+# ---------------------------------------------------------------- main
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dir", help="the pieces folder")
+    common.add_argument("--font", help="console font (.psf, .psf.gz or a font export .json)")
+    common.add_argument("--size", help="console size as COLUMNSxROWS, like 160x50")
+
+    p = argparse.ArgumentParser(prog="ttyskin", description="Colour text art for the Linux login console.")
+    p.add_argument("--version", action="version", version="ttyskin " + VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="command")
+
+    sub.add_parser("list", parents=[common], help="list the pieces").set_defaults(fn=cmd_list)
+    s = sub.add_parser("show", parents=[common], help="print a piece in this terminal")
+    s.add_argument("name")
+    s.add_argument("--issue", action="store_true", help="print the issue file it would install instead")
+    s.set_defaults(fn=cmd_show)
+    s = sub.add_parser("check", parents=[common], help="check a piece")
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_check)
+    s = sub.add_parser("use", parents=[common], help="install a piece (root)")
+    s.add_argument("name")
+    s.add_argument("--dry-run", action="store_true", help="print what it would do, change nothing")
+    s.add_argument("--force", action="store_true", help="replace an issue file ttyskin didn't write")
+    s.set_defaults(fn=cmd_use)
+    s = sub.add_parser("off", parents=[common], help="remove the art, restore the palette (root)")
+    s.add_argument("--dry-run", action="store_true", help="print what it would do, change nothing")
+    s.add_argument("--force", action="store_true", help="remove an issue file ttyskin didn't write")
+    s.set_defaults(fn=cmd_off)
+    sub.add_parser("status", parents=[common], help="what is in use").set_defaults(fn=cmd_status)
+    s = sub.add_parser("font", parents=[common], help="font tools")
+    fsub = s.add_subparsers(dest="fcmd", metavar="font-command")
+    e = fsub.add_parser("export", help="write the console font as JSON for ttyskin.html")
+    e.add_argument("--psf", help="the font to export (default: this machine's console font)")
+    e.add_argument("-o", "--output", help="file to write (default: standard output)")
+    e.set_defaults(fn=cmd_font_export)
+    return p
+
+
+def main(argv=None):
+    p = build_parser()
+    args = p.parse_args(argv)
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return EXIT_USAGE
+    try:
+        return args.fn(args)
+    except Fail as f:
+        print("ttyskin: %s" % f, file=sys.stderr)
+        return f.code
+    except BrokenPipeError:
+        return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
