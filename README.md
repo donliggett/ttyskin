@@ -6,10 +6,10 @@
   ██│     ██│     ██│   ████┌─┘ ██│ ██│ ██████┐ ██│ ██│
   └─┘     └─┘     └─┘   └───┘   └─┘ └─┘ └─────┘ └─┘ └─┘
 
-  colour art for the linux login console
+  color art for the linux login console
 ```
 
-ttyskin puts colour text art on the Linux login console: the text screen a machine shows after it boots, above the `login:` prompt. You keep as many pieces of art as you like and switch between them with one command.
+ttyskin puts color text art on the Linux login console: the text screen a machine shows after it boots, above the `login:` prompt. You keep as many pieces of art as you like and switch between them with one command.
 
 - **`ttyskin`** installs a piece, removes it, and checks pieces against the console's font and size.
 - **`ttyskin.html`** shows pieces exactly as the console draws them, in the console's own bitmap font, and lets you edit them.
@@ -17,8 +17,8 @@ ttyskin puts colour text art on the Linux login console: the text screen a machi
 ## How it works
 
 - The login prompt (`agetty`) prints `/etc/issue` and then every file in `/etc/issue.d/`. ttyskin writes one file there, `/etc/issue.d/ttyskin.issue`. It never edits `/etc/issue`.
-- Colour comes from standard escape sequences in that file: 16 colours for text, 8 for backgrounds.
-- A piece can also bring its own palette: the 16 colours themselves. ttyskin sets them with `setvtrgb`, and a small boot unit keeps them across reboots. A palette applies to the whole console, not only to the art.
+- Color comes from standard escape sequences in that file: 16 colors for text, 8 for backgrounds.
+- A piece can also bring its own palette: the 16 colors themselves. ttyskin sets them with `setvtrgb`, and a small boot unit keeps them across reboots. A palette applies to the whole console, not only to the art.
 - Art can include live values that the login prompt fills in each time it draws: host name, IP address, date, time, logged-in users, terminal name, OS name.
 - After a change, ttyskin asks the login prompts to redraw, so there is no reboot.
 
@@ -74,7 +74,7 @@ ttyskin status
 | --- | --- |
 | `list` | lists the pieces, marking the one in use |
 | `show <name>` | prints the piece in this terminal; `--issue` prints the file it would install |
-| `check <name>` | checks colour codes, characters against the console font, and width against the console |
+| `check <name>` | checks color codes, characters against the console font, and width against the console |
 | `use <name>` | installs the piece and its palette, then redraws the login prompt (root) |
 | `off` | removes the art, restores the palette saved before the first `use`, and redraws (root) |
 | `status` | the piece in use, the palette, the font, the console's size |
@@ -93,13 +93,13 @@ A piece is a folder, named in lowercase letters, digits and dashes:
 ```text
 pieces/<name>/
   art.txt       the characters, one line per row
-  fg.txt        text colour per cell: 0-f a palette slot, . the default   (optional)
-  bg.txt        background colour per cell: 0-7, or .                   (optional)
+  fg.txt        text color per cell: 0-f a palette slot, . the default   (optional)
+  bg.txt        background color per cell: 0-7, or .                   (optional)
   palette.txt   16 lines of #rrggbb, in console order                   (optional)
   piece.json    {"title", "author", "license", "notes"}                  (optional)
 ```
 
-`fg.txt` and `bg.txt` have the same shape as `art.txt`. Live values are written in `art.txt` as `{host}`, `{ipv4}`, `{ipv4:eth0}`, `{date}`, `{time}`, `{users}`, `{tty}` and `{os}`; each takes the colour of its first cell. Other text in braces is drawn as written.
+`fg.txt` and `bg.txt` have the same shape as `art.txt`. Live values are written in `art.txt` as `{host}`, `{ipv4}`, `{ipv4:eth0}`, `{date}`, `{time}`, `{users}`, `{tty}` and `{os}`; each takes the color of its first cell. Other text in braces is drawn as written.
 
 Only the sample piece is tracked by git; other folders in `pieces/` are ignored, so your own art stays yours. `pieces/sample` is the wordmark above, with a palette and two live values.
 
@@ -132,6 +132,6 @@ python3 -m unittest discover -s tests
 
 The tests run against a temporary folder standing in for `/` and change nothing on the machine.
 
-## Licence
+## License
 
 MIT. The bundled console font comes from console-setup and is in the public domain; see [LICENSE](LICENSE).

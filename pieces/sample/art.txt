@@ -5,6 +5,6 @@
    ██│     ██│     ██│   ████┌─┘ ██│ ██│ ██████┐ ██│ ██│
    └─┘     └─┘     └─┘   └───┘   └─┘ └─┘ └─────┘ └─┘ └─┘
 
-  colour art for the linux login console
+  color art for the linux login console
 
   {os}  ·  {tty}

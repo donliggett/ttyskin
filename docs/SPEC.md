@@ -1,6 +1,6 @@
 # ttyskin: specification
 
-Status: version 0.1, built. Section 6 lists what still needs checking on a real console.
+Status: version 0.1, built and checked on a real console (§6).
 
 ttyskin puts colour text art on the Linux login console (the text screen a machine shows after boot, before anyone logs in) and lets you switch between pieces of art. It has two parts:
 
@@ -103,13 +103,15 @@ LICENSE                          MIT; the font's public-domain note
 
 Install is a clone and a link: the clone in `/opt/ttyskin`, the command linked into `/usr/local/bin`, the unit copied to `/etc/systemd/system`. The README gives the exact commands.
 
-## 6. To check on a real console
+## 6. Checked
 
-Done in development: the command's behaviour against a stand-in root (31 tests), the page in headless Chromium (rendering, editing, saving into a folder), the default font's licence.
+In development: the command's behaviour against a stand-in root (31 tests, Python 3.13 and 3.14), the page in headless Chromium (rendering, editing, saving into a folder), the default font's licence.
 
-Still to check on a real console, not in a terminal emulator:
+On a real console (Ubuntu 26.04, util-linux 2.41.3, systemd 259, 2560×1440 framebuffer, 2026-10-20):
 
-- That bright text shows as `1;3x` gives it (and whether `9x` works too).
-- That `agetty --reload` redraws every console's prompt.
-- That `setvtrgb` run from an SSH session changes the console's palette straight away.
-- That the palette survives a reboot with the unit ordered after the distribution's own palette unit.
+- Bright text written as `1;3x` shows as the bright colour.
+- `agetty --reload` redraws a waiting login prompt straight away.
+- `setvtrgb` run from an SSH session changes the console's palette straight away.
+- The palette survives a reboot: `ttyskin-palette.service` runs right after the distribution's `setvtrgb.service`.
+
+Not checked: whether `9x` (`TTYSKIN_BRIGHT=aixterm`) also works on the Linux console.
