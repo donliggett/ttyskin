@@ -3,23 +3,38 @@
 
 Installs a piece of art as /etc/issue.d/ttyskin.issue (printed by agetty above
 the login prompt), sets the console's 16-colour palette with setvtrgb, and
-checks pieces against the console's font and size. See docs/SPEC.md.
+checks pieces against the console's font and size. `ttyskin watch` keeps the
+addresses in the art current. See docs/SPEC.md.
 """
 
 import argparse
+import contextlib
 import datetime
+import errno
 import glob
-import gzip
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import socket
+import stat
+import struct
 import subprocess
 import sys
+import time
+import unicodedata
+import zlib
 
-VERSION = "0.3.0"
+try:
+    import fcntl
+except ImportError:  # not on Linux: no locking (the tests still run)
+    fcntl = None
+
+VERSION = "0.4.0"
 
 EXIT_OK, EXIT_CHECK, EXIT_USAGE, EXIT_ROOT, EXIT_MISSING, EXIT_IN_THE_WAY = 0, 1, 2, 3, 4, 5
 
@@ -29,11 +44,31 @@ IFACE_RE = r"[A-Za-z0-9_.:@-]+"
 TOKEN_RE = re.compile(r"\{(host|date|time|users|tty|os|ipv4(?::" + IFACE_RE + r")?)\}")
 LOOKS_LIKE_TOKEN_RE = re.compile(r"\{[a-z0-9]+(?::[^{}\s]*)?\}")
 
-# agetty issue-file escapes for each live value.
+# agetty issue-file escapes for each live value. Addresses are not among them:
+# ttyskin writes them as text (an address escape makes agetty redraw on every
+# network event).
 TOKEN_ESCAPES = {"host": r"\n", "date": r"\d", "time": r"\t", "users": r"\u",
                  "tty": r"\l", "os": r"\S"}
 
+# what an address value shows when the interface has no IPv4 address
+NO_ADDRESS = "-"
+
 AGETTY_MIN = (2, 36)
+
+# system commands are taken from these folders only, never from PATH
+SYSTEM_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+COMMAND_TIMEOUT = 10  # seconds, for every command ttyskin runs
+
+PIECE_FILES = ("art.txt", "fg.txt", "bg.txt", "palette.txt", "piece.json")
+MAX_PIECE_FILE = 1 << 20  # bytes, each
+MAX_FONT_FILE = 8 << 20   # bytes, after decompressing
+
+# the watcher
+WATCH_SETTLE = 3          # seconds of quiet after the last event, by default
+WATCH_SETTLE_RANGE = (1, 60)
+WATCH_MAX_WAIT = 60       # look at the latest this long after the first event of a burst
+WATCH_INTERVAL = 10       # at most one redraw this often
+AGETTY_RELOAD_FILE = "/run/agetty.reload"
 
 # ---------------------------------------------------------------- paths
 
@@ -70,6 +105,15 @@ def saved_vtrgb_file():
 
 def config_file():
     return os.path.join(state_dir(), "config")
+
+
+def lock_file():
+    return os.path.join(state_dir(), "lock")
+
+
+def current_dir():
+    """The validated copy of the piece in use; the watcher renders from it."""
+    return os.path.join(state_dir(), "current")
 
 # ---------------------------------------------------------------- small helpers
 
@@ -122,6 +166,104 @@ def read_state():
 def is_test_mode():
     return bool(root_prefix())
 
+
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+O_NOCTTY = getattr(os, "O_NOCTTY", 0)
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+# pieces are read through their open folder where the platform allows it
+DIR_FD_OK = bool(O_DIRECTORY and O_NOFOLLOW and os.open in os.supports_dir_fd
+                 and os.stat in os.supports_dir_fd)
+
+
+def read_regular(path, limit, follow=True, dir_fd=None):
+    """The bytes of a regular file of at most `limit` bytes (`path` relative
+    to the open folder `dir_fd` when given). Raises FileNotFoundError if it
+    doesn't exist and ValueError, with a reason, if it is a link (when follow
+    is false), not a regular file, or too big. Opening never blocks, so a fifo
+    can't hang the command."""
+    flags = os.O_RDONLY | O_CLOEXEC | O_NONBLOCK | getattr(os, "O_BINARY", 0)
+    if not follow:
+        flags |= O_NOFOLLOW
+        if not O_NOFOLLOW and os.path.islink(path):
+            raise ValueError("it is a link; ttyskin doesn't follow links in pieces")
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd) if dir_fd is not None else os.open(path, flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError("it is a link; ttyskin doesn't follow links in pieces")
+        if isinstance(e, FileNotFoundError):
+            raise
+        raise ValueError(e.strerror or str(e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if st.st_size > limit:
+            raise ValueError("bigger than %d bytes" % limit)
+        chunks, size = [], 0
+        while True:
+            b = os.read(fd, min(65536, limit + 1 - size))
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+            if size > limit:
+                raise ValueError("bigger than %d bytes" % limit)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def state_lock():
+    """An exclusive lock on /etc/ttyskin/lock, held by use, off and each look
+    the watcher takes, around reading state, rendering and writing."""
+    os.makedirs(state_dir(), exist_ok=True)
+    fd = os.open(lock_file(), os.O_RDWR | os.O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o644)
+    try:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def find_command(name, dirs=SYSTEM_DIRS):
+    """The full path of a system command, from fixed folders only (never PATH)."""
+    for d in dirs:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def system_command(name):
+    """find_command, or the bare name in test mode (where nothing is run)."""
+    return name if is_test_mode() else find_command(name)
+
+
+def run_command(cmd):
+    """Run an argument list (no shell) with a timeout; returns the
+    CompletedProcess. Raises OSError if it can't run or times out."""
+    try:
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise OSError("%s took longer than %d seconds" % (cmd[0], COMMAND_TIMEOUT))
+
+
+def command_output(name, *args):
+    """A system command's standard output, or None if it isn't there or fails to run."""
+    exe = find_command(name)
+    if not exe:
+        return None
+    try:
+        return run_command([exe] + list(args)).stdout
+    except OSError:
+        return None
+
 # ---------------------------------------------------------------- pieces
 
 def pieces_dir(args):
@@ -140,38 +282,96 @@ def list_pieces(pdir):
     if not os.path.isdir(pdir):
         return out
     for name in sorted(os.listdir(pdir)):
-        if os.path.isfile(os.path.join(pdir, name, "art.txt")):
+        if os.path.lexists(os.path.join(pdir, name, "art.txt")):
             out.append(name)
     return out
 
 
-def read_lines(path):
-    if not os.path.exists(path):
+def split_lines(text):
+    if text is None:
         return None
-    text = read_text(path).replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.split("\n")
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if lines and lines[-1] == "":
         lines.pop()
     return lines
 
 
 class Piece:
-    def __init__(self, pdir, name):
+    """A piece's files, read safely: no links (the folder or its files), only
+    regular files, at most MAX_PIECE_FILE bytes each, UTF-8. Problems are
+    collected in self.errors (check reports them) instead of being read."""
+
+    def __init__(self, pdir, name, path=None):
         self.name = name
-        self.path = os.path.join(pdir, name)
-        if not os.path.isfile(os.path.join(self.path, "art.txt")):
-            raise Fail("no piece called %r in %s" % (name, pdir), EXIT_USAGE)
-        self.art = read_lines(os.path.join(self.path, "art.txt")) or []
-        self.fg = read_lines(os.path.join(self.path, "fg.txt"))
-        self.bg = read_lines(os.path.join(self.path, "bg.txt"))
-        self.palette_lines = read_lines(os.path.join(self.path, "palette.txt"))
-        self.meta_path = os.path.join(self.path, "piece.json")
+        self.path = path or os.path.join(pdir, name)
+        self.errors = []
+        self.texts = {}
+        self.dir_fd = None  # the open piece folder while its files are read
+        self.read_by_dir_fd = False
+        link_error = ("%s: the piece folder is a link; ttyskin doesn't follow links in pieces"
+                      % self.path)
+        missing = Fail("no piece called %r in %s" % (name, pdir), EXIT_USAGE)
+        if DIR_FD_OK:
+            # open the folder once, then each file relative to it, so the
+            # folder can't be swapped for a link between the check and the reads
+            try:
+                self.dir_fd = os.open(self.path, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            except OSError as e:
+                if e.errno == errno.ELOOP or (e.errno == errno.ENOTDIR and os.path.islink(self.path)):
+                    self.errors.append(link_error)
+                elif e.errno in (errno.ENOENT, errno.ENOTDIR):
+                    raise missing
+                else:
+                    raise Fail("can't open %s: %s" % (self.path, e.strerror or e), EXIT_USAGE)
+            if self.dir_fd is not None:
+                try:
+                    try:
+                        os.stat("art.txt", dir_fd=self.dir_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        raise missing
+                    self.read_by_dir_fd = True
+                    self._read_all()
+                finally:
+                    os.close(self.dir_fd)
+                    self.dir_fd = None
+        elif os.path.islink(self.path):
+            self.errors.append(link_error)
+        elif not os.path.isdir(self.path) or not os.path.lexists(os.path.join(self.path, "art.txt")):
+            raise missing
+        else:
+            self._read_all()
+        self.art = split_lines(self.texts.get("art.txt")) or []
+        self.fg = split_lines(self.texts.get("fg.txt"))
+        self.bg = split_lines(self.texts.get("bg.txt"))
+        self.palette_lines = split_lines(self.texts.get("palette.txt"))
+        self.meta_text = self.texts.get("piece.json")
+
+    def _read_all(self):
+        for fname in PIECE_FILES:
+            text = self._read(fname)
+            if text is not None:
+                self.texts[fname] = text
+
+    def _read(self, fname):
+        try:
+            if self.dir_fd is not None:
+                data = read_regular(fname, MAX_PIECE_FILE, follow=False, dir_fd=self.dir_fd)
+            else:
+                data = read_regular(os.path.join(self.path, fname), MAX_PIECE_FILE, follow=False)
+            return data.decode("utf-8")
+        except FileNotFoundError:
+            return None
+        except UnicodeDecodeError as e:
+            self.errors.append("%s: not UTF-8 (byte %d)" % (fname, e.start + 1))
+        except ValueError as e:
+            self.errors.append("%s: %s" % (fname, e))
+        return None
 
     def meta(self):
         try:
-            m = json.loads(read_text(self.meta_path))
+            m = json.loads(self.meta_text) if self.meta_text is not None else {}
             return m if isinstance(m, dict) else {}
-        except (FileNotFoundError, ValueError):
+        except ValueError:
             return {}
 
     def title(self):
@@ -223,15 +423,36 @@ class Piece:
 
 # ---------------------------------------------------------------- fonts
 
+def gunzip_limited(data, limit):
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(data, limit + 1)
+    except zlib.error as e:
+        raise ValueError("bad gzip data (%s)" % e)
+    if len(out) > limit or d.unconsumed_tail:
+        raise ValueError("bigger than %d bytes uncompressed" % limit)
+    return out
+
+
 def parse_psf(data):
-    """Return (width, height, glyph_bytes_list, {codepoint: glyph_index})."""
+    """Return (width, height, glyph_bytes_list, {codepoint: glyph_index}).
+    Every size in the header is bounded before anything is allocated; a bad
+    font raises ValueError."""
     if data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
+        data = gunzip_limited(data, MAX_FONT_FILE)
+    if len(data) > MAX_FONT_FILE:
+        raise ValueError("bigger than %d bytes" % MAX_FONT_FILE)
     cmap = {}
     if data[:2] == b"\x36\x04":
+        if len(data) < 4:
+            raise ValueError("truncated PSF1 header")
         mode, charsize = data[2], data[3]
         n = 512 if mode & 1 else 256
         width, height = 8, charsize
+        if not 1 <= height <= 64:
+            raise ValueError("PSF1 glyph height %d is not 1-64" % height)
+        if 4 + n * charsize > len(data):
+            raise ValueError("truncated: %d glyphs of %d bytes don't fit" % (n, charsize))
         glyphs = [data[4 + i * charsize: 4 + (i + 1) * charsize] for i in range(n)]
         if mode & 2:
             pos, idx = 4 + n * charsize, 0
@@ -250,7 +471,18 @@ def parse_psf(data):
             cmap = {i: i for i in range(n)}
         return width, height, glyphs, cmap
     if data[:4] == b"\x72\xb5\x4a\x86":
+        if len(data) < 32:
+            raise ValueError("truncated PSF2 header")
         hsize, flags, n, charsize, height, width = [int.from_bytes(data[o:o + 4], "little") for o in range(8, 32, 4)]
+        if not 1 <= n <= 65536:
+            raise ValueError("PSF2 header claims %d glyphs (at most 65536)" % n)
+        if not (1 <= width <= 64 and 1 <= height <= 64):
+            raise ValueError("PSF2 glyphs of %dx%d (at most 64x64)" % (width, height))
+        if charsize != height * ((width + 7) // 8):
+            raise ValueError("PSF2 says %d bytes per glyph; %dx%d needs %d"
+                             % (charsize, width, height, height * ((width + 7) // 8)))
+        if not 32 <= hsize <= len(data) or hsize + n * charsize > len(data):
+            raise ValueError("truncated: %d glyphs of %d bytes don't fit" % (n, charsize))
         glyphs = [data[hsize + i * charsize: hsize + (i + 1) * charsize] for i in range(n)]
         if flags & 1:
             tab = data[hsize + n * charsize:]
@@ -274,14 +506,19 @@ def parse_psf(data):
 class Font:
     def __init__(self, path):
         self.path = path
+        data = read_regular(path, MAX_FONT_FILE)
         if path.endswith(".json"):
-            d = json.loads(read_text(path))
+            d = json.loads(data.decode("utf-8"))
             self.width, self.height = d["width"], d["height"]
+            if not (isinstance(self.width, int) and isinstance(self.height, int)
+                    and 1 <= self.width <= 64 and 1 <= self.height <= 64):
+                raise ValueError("width and height must be 1-64")
+            if len(d["glyphs"]) > 65536:
+                raise ValueError("more than 65536 glyphs")
             self.glyphs = [bytes.fromhex(g) for g in d["glyphs"]]
             self.map = {int(k): v for k, v in d["map"].items()}
         else:
-            with open(path, "rb") as f:
-                self.width, self.height, self.glyphs, self.map = parse_psf(f.read())
+            self.width, self.height, self.glyphs, self.map = parse_psf(data)
 
     def has(self, ch):
         return ord(ch) in self.map
@@ -305,9 +542,13 @@ def load_font(args):
     path = getattr(args, "font", None) or read_config().get("font") or default_font_path()
     if not path:
         return None
+    return open_font(path)
+
+
+def open_font(path):
     try:
         return Font(path)
-    except (OSError, ValueError, KeyError) as e:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         raise Fail("can't read the font %s: %s" % (path, e), EXIT_MISSING)
 
 
@@ -328,17 +569,49 @@ def console_size(args, font):
 
 # ---------------------------------------------------------------- check
 
-def check_piece(piece, font, size):
-    """Return (errors, warnings), each a list of strings."""
-    errors, warnings = [], []
-    if not NAME_RE.match(piece.name):
-        errors.append("name: use lowercase letters, digits and dashes (%r)" % piece.name)
+def char_problem(ch):
+    """Why a character can't be in art.txt, whatever font is loaded, or None."""
+    o = ord(ch)
+    if ch == "\t":
+        return "a tab; use spaces"
+    if o < 32 or o == 127:
+        return "a control character (U+%04X)" % o
+    if 0x80 <= o <= 0x9F:
+        return "a C1 control character (U+%04X)" % o
+    if 0xD800 <= o <= 0xDFFF:
+        return "a lone surrogate (U+%04X)" % o
+    if unicodedata.category(ch) == "Cf":
+        return "an invisible format character (U+%04X %s)" % (o, unicodedata.name(ch, "unnamed"))
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return "a character two cells wide (U+%04X)" % o
+    return None
+
+
+def clean(text):
+    """Text from a piece (or anything else a piece can influence), made safe to
+    print: every character char_problem() rejects becomes "?", so nothing a
+    piece holds can send escape codes to the terminal running ttyskin."""
+    return "".join("?" if char_problem(ch) else ch for ch in str(text))
+
+
+def char_errors(piece):
+    """The piece's file problems and the characters in art.txt that can't be
+    drawn whatever the font: what use and show both refuse."""
+    errors = list(piece.errors)
     for r, line in enumerate(piece.art):
         for c, ch in enumerate(line):
-            if ch == "\t":
-                errors.append("art.txt %d:%d: a tab; use spaces" % (r + 1, c + 1))
-            elif ord(ch) < 32 or ord(ch) == 127:
-                errors.append("art.txt %d:%d: a control character (U+%04X)" % (r + 1, c + 1, ord(ch)))
+            problem = char_problem(ch)
+            if problem:
+                errors.append("art.txt %d:%d: %s" % (r + 1, c + 1, problem))
+    return errors
+
+
+def check_piece(piece, font, size):
+    """Return (errors, warnings), each a list of strings."""
+    errors, warnings = char_errors(piece), []
+    if not NAME_RE.match(piece.name):
+        errors.insert(len(piece.errors), "name: use lowercase letters, digits and dashes (%r)" % piece.name)
+    for r, line in enumerate(piece.art):
         for m in LOOKS_LIKE_TOKEN_RE.finditer(line):
             if not TOKEN_RE.fullmatch(m.group(0)):
                 warnings.append("art.txt %d:%d: %s is not a live value; it is drawn as written"
@@ -357,9 +630,9 @@ def check_piece(piece, font, size):
         piece.palette()
     except ValueError as e:
         errors.append("palette.txt: %s" % e)
-    if os.path.exists(piece.meta_path):
+    if piece.meta_text is not None:
         try:
-            if not isinstance(json.loads(read_text(piece.meta_path)), dict):
+            if not isinstance(json.loads(piece.meta_text), dict):
                 errors.append("piece.json: must be a JSON object")
         except ValueError as e:
             errors.append("piece.json: %s" % e)
@@ -437,7 +710,11 @@ def render(piece, esc, sgr, token_text):
     return "\n".join(out) + "\n"
 
 
-def to_issue(piece):
+def to_issue(piece, addresses=None):
+    """The issue file. Address values come from `addresses` (address_key ->
+    text, as shown_addresses returns); the other live values are agetty escapes."""
+    addresses = addresses or {}
+
     def esc(ch):
         return "\\\\" if ch == "\\" else ch
 
@@ -446,9 +723,175 @@ def to_issue(piece):
 
     def tok(kind, arg):
         if kind == "ipv4":
-            return "\\4{%s}" % arg if arg else "\\4"
+            return addresses.get(address_key(arg), NO_ADDRESS)
         return TOKEN_ESCAPES[kind]
     return render(piece, esc, sgr, tok)
+
+# ---------------------------------------------------------------- addresses
+
+def address_key(arg):
+    return "ipv4:" + arg if arg else "ipv4"
+
+
+def address_keys(piece):
+    """The address values the piece shows, as address_key strings."""
+    keys = set()
+    for r in range(piece.rows()):
+        for it in piece.row_items(r):
+            if it[0] == "token" and it[5] == "ipv4":
+                keys.add(address_key(it[6]))
+    return sorted(keys)
+
+
+IFF_UP, IFF_LOOPBACK, IFF_RUNNING = 0x1, 0x8, 0x40
+RT_SCOPE_UNIVERSE = 0
+
+
+def pick_address(ifaddrs, iface):
+    """The address to show, or None. ifaddrs: (label, address, link_flags,
+    scope) in the kernel's order. With an interface: its first IPv4 address
+    (matched by label, as agetty's \\4{iface} did). Without: the first
+    global-scope address on an interface that is up, running and not loopback."""
+    for label, addr, flags, scope in ifaddrs:
+        if iface:
+            if label != iface:
+                continue
+        elif (flags & IFF_LOOPBACK or not flags & IFF_UP or not flags & IFF_RUNNING
+              or scope != RT_SCOPE_UNIVERSE):
+            continue
+        return addr
+    return None
+
+
+def valid_address(addr):
+    """The address as text if it is a valid IPv4 address, else NO_ADDRESS."""
+    try:
+        return str(ipaddress.IPv4Address(addr))
+    except (ipaddress.AddressValueError, ValueError, TypeError):
+        return NO_ADDRESS
+
+
+def shown_addresses(keys, ifaddrs):
+    """{address_key: text} for the keys, every value validated."""
+    out = {}
+    for k in keys:
+        _, _, iface = k.partition(":")
+        out[k] = valid_address(pick_address(ifaddrs, iface or None))
+    return out
+
+
+def address_changes(old, new):
+    """[(key, before, after)] for each address value that differs."""
+    return [(k, old.get(k), new.get(k)) for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
+
+
+NLMSG_ERROR, NLMSG_DONE = 2, 3
+RTM_NEWLINK, RTM_GETLINK, RTM_NEWADDR, RTM_GETADDR = 16, 18, 20, 22
+NLM_F_REQUEST, NLM_F_DUMP, NLM_F_DUMP_INTR = 0x1, 0x300, 0x10
+IFLA_IFNAME, IFA_ADDRESS, IFA_LOCAL, IFA_LABEL = 3, 1, 2, 3
+RTMGRP_LINK, RTMGRP_IPV4_IFADDR = 0x1, 0x10
+NL_HDR = struct.Struct("=IHHII")
+NL_MAX_DUMP = 16 << 20  # bytes; a dump bigger than this is refused
+
+
+def nl_attrs(data, off):
+    """{type: payload} of the netlink attributes in data[off:]."""
+    attrs = {}
+    while off + 4 <= len(data):
+        alen, atype = struct.unpack_from("=HH", data, off)
+        if alen < 4 or off + alen > len(data):
+            break
+        attrs.setdefault(atype & 0x3FFF, data[off + 4:off + alen])
+        off += (alen + 3) & ~3
+    return attrs
+
+
+def nl_dump(sock, msg_type, body, seq):
+    """Send one dump request and return the [(type, payload)] answers."""
+    sock.send(NL_HDR.pack(NL_HDR.size + len(body), msg_type, NLM_F_REQUEST | NLM_F_DUMP, seq, 0) + body)
+    out, total = [], 0
+    while True:
+        data = sock.recv(1 << 16)
+        total += len(data)
+        if not data or total > NL_MAX_DUMP:
+            raise OSError("netlink dump too large or cut short")
+        off = 0
+        while off + NL_HDR.size <= len(data):
+            mlen, mtype, mflags, mseq, _ = NL_HDR.unpack_from(data, off)
+            if mlen < NL_HDR.size or off + mlen > len(data):
+                break
+            payload = data[off + NL_HDR.size:off + mlen]
+            off += (mlen + 3) & ~3
+            if mseq != seq:
+                continue
+            if mtype == NLMSG_DONE:
+                if mflags & NLM_F_DUMP_INTR:
+                    raise InterruptedError("the addresses changed during the dump")
+                return out
+            if mtype == NLMSG_ERROR:
+                err = struct.unpack_from("=i", payload)[0] if len(payload) >= 4 else -errno.EIO
+                if err:
+                    raise OSError(-err, os.strerror(-err))
+                continue
+            out.append((mtype, payload))
+
+
+def netlink_ifaddrs():
+    """[(label, address, link_flags, scope)] for every IPv4 address, in the
+    kernel's order, from an RTM_GETLINK and an RTM_GETADDR dump. Raises OSError."""
+    for attempt in range(3):
+        try:
+            with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | getattr(socket, "SOCK_CLOEXEC", 0),
+                               socket.NETLINK_ROUTE) as s:
+                s.settimeout(2)
+                s.bind((0, 0))
+                flags, names = {}, {}
+                for mtype, p in nl_dump(s, RTM_GETLINK, struct.pack("=BxHiII", socket.AF_UNSPEC, 0, 0, 0, 0), 1):
+                    if mtype == RTM_NEWLINK and len(p) >= 16:
+                        _, _, index, iflags, _ = struct.unpack_from("=BxHiII", p)
+                        flags[index] = iflags
+                        name = nl_attrs(p, 16).get(IFLA_IFNAME, b"")
+                        names[index] = name.split(b"\0")[0].decode("utf-8", "replace")
+                out = []
+                for mtype, p in nl_dump(s, RTM_GETADDR, struct.pack("=BBBBI", socket.AF_INET, 0, 0, 0, 0), 2):
+                    if mtype != RTM_NEWADDR or len(p) < 8:
+                        continue
+                    family, _, _, scope, index = struct.unpack_from("=BBBBI", p)
+                    if family != socket.AF_INET:
+                        continue
+                    a = nl_attrs(p, 8)
+                    raw = a.get(IFA_LOCAL, a.get(IFA_ADDRESS))
+                    if raw is None or len(raw) != 4:
+                        continue
+                    label = a.get(IFA_LABEL)
+                    label = label.split(b"\0")[0].decode("utf-8", "replace") if label else names.get(index, "")
+                    out.append((label, socket.inet_ntoa(raw), flags.get(index, 0), scope))
+                return out
+        except InterruptedError:
+            if attempt == 2:
+                raise OSError("the addresses kept changing while being read")
+    return []
+
+
+def ifaddrs():
+    """This machine's IPv4 addresses (see netlink_ifaddrs); none in test mode."""
+    if is_test_mode():
+        return []
+    if not hasattr(socket, "AF_NETLINK"):
+        raise OSError("reading addresses needs Linux")
+    return netlink_ifaddrs()
+
+
+def current_addresses(keys, warn):
+    """shown_addresses for this machine; on an error, warn and show NO_ADDRESS."""
+    if not keys:
+        return {}
+    try:
+        found = ifaddrs()
+    except OSError as e:
+        warn("can't read this machine's addresses (%s); they show as %s" % (e, NO_ADDRESS))
+        found = []
+    return shown_addresses(keys, found)
 
 
 def local_value(kind, arg):
@@ -460,8 +903,9 @@ def local_value(kind, arg):
         if kind == "time":
             return datetime.datetime.now().strftime("%H:%M:%S")
         if kind == "users":
-            out = subprocess.run(["who"], capture_output=True, text=True).stdout
-            return str(len([l for l in out.splitlines() if l.strip()]))
+            out = command_output("who")
+            if out is not None:
+                return str(len([l for l in out.splitlines() if l.strip()]))
         if kind == "tty":
             return os.path.basename(os.ttyname(0))
         if kind == "os":
@@ -469,11 +913,8 @@ def local_value(kind, arg):
                 if line.startswith("PRETTY_NAME="):
                     return line.split("=", 1)[1].strip('"')
         if kind == "ipv4":
-            cmd = ["ip", "-4", "-o", "addr", "show"] + (["dev", arg] if arg else ["scope", "global"])
-            out = subprocess.run(cmd, capture_output=True, text=True).stdout.split()
-            if "inet" in out:
-                return out[out.index("inet") + 1].split("/")[0]
-    except (OSError, ValueError):
+            return valid_address(pick_address(ifaddrs(), arg or None))
+    except (OSError, ValueError, AttributeError):
         pass
     return "?"
 
@@ -494,7 +935,7 @@ def to_terminal(piece, truecolor):
                 parts.append("48;2;%d;%d;%d" % pal[bg])
             return "\x1b[" + ";".join(parts) + "m"
         return "\x1b[" + sgr_16(fg, bg) + "m"
-    return render(piece, lambda ch: ch, sgr, local_value)
+    return render(piece, clean, sgr, lambda kind, arg: clean(local_value(kind, arg)))
 
 # ---------------------------------------------------------------- palette
 
@@ -517,11 +958,22 @@ def current_vtrgb():
 # ---------------------------------------------------------------- actions
 
 class Plan:
-    def __init__(self, dry):
+    """Says and does each step of a change. A dry run only says them; a quiet
+    plan (the watcher's) does them and reports only problems."""
+
+    def __init__(self, dry, quiet=False):
         self.dry = dry
+        self.quiet = quiet
 
     def say(self, msg):
-        print(("would " if self.dry else "") + msg)
+        if not self.quiet:
+            print(("would " if self.dry else "") + msg)
+
+    def problem(self, msg):
+        if self.quiet:
+            log_problem(msg)
+        else:
+            print("  (%s)" % msg)
 
     def write(self, path, data):
         self.say("write %s (%d bytes)" % (path, len(data.encode("utf-8"))))
@@ -534,18 +986,67 @@ class Plan:
             if not self.dry:
                 os.remove(path)
 
+    def write_current(self, piece):
+        self.say("write %s%s (%s)" % (current_dir(), os.sep, ", ".join(sorted(piece.texts))))
+        if not self.dry:
+            write_current(piece)
+
+    def remove_current(self):
+        if os.path.lexists(current_dir()):
+            self.say("remove %s%s" % (current_dir(), os.sep))
+            if not self.dry:
+                remove_tree(current_dir())
+
     def run(self, cmd, ok_fail=False):
         self.say("run: %s" % " ".join(cmd))
         if self.dry or is_test_mode():
             return True
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            msg = (r.stderr or r.stdout).strip()
+        try:
+            r = run_command(cmd)
+            ok, msg = r.returncode == 0, (r.stderr or r.stdout).strip()
+        except OSError as e:
+            ok, msg = False, str(e)
+        if not ok:
             if ok_fail:
-                print("  (it failed: %s)" % msg)
+                self.problem("%s failed: %s" % (os.path.basename(cmd[0]), msg))
                 return False
             raise Fail("%s failed: %s" % (cmd[0], msg), EXIT_MISSING)
         return True
+
+
+def remove_tree(path):
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.remove(path)
+    else:
+        shutil.rmtree(path)
+
+
+def write_current(piece):
+    """Save the piece's files, as read and checked, to /etc/ttyskin/current/:
+    written into a new folder, then renamed into place."""
+    base = state_dir()
+    os.makedirs(base, exist_ok=True)
+    new, old = os.path.join(base, ".current.new"), os.path.join(base, ".current.old")
+    for p in (new, old):
+        if os.path.lexists(p):
+            remove_tree(p)
+    os.mkdir(new, 0o755)
+    os.chmod(new, 0o755)
+    for fname, text in sorted(piece.texts.items()):
+        path = os.path.join(new, fname)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC
+                     | getattr(os, "O_BINARY", 0), 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("utf-8"))
+        os.chmod(path, 0o644)
+    cur = current_dir()
+    if os.path.islink(cur) or os.path.isfile(cur):
+        os.remove(cur)
+    elif os.path.isdir(cur):
+        os.rename(cur, old)
+    os.rename(new, cur)
+    if os.path.lexists(old):
+        remove_tree(old)
 
 
 def need_root(dry):
@@ -558,11 +1059,14 @@ def need_root(dry):
 def agetty_ok():
     if is_test_mode():
         return
-    exe = shutil.which("agetty") or "/sbin/agetty"
+    exe = find_command("agetty")
+    if not exe:
+        raise Fail("agetty not found in %s; ttyskin needs util-linux agetty %d.%d or newer"
+                   % (", ".join(SYSTEM_DIRS), AGETTY_MIN[0], AGETTY_MIN[1]), EXIT_MISSING)
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
-    except OSError:
-        raise Fail("agetty not found; ttyskin needs util-linux agetty %d.%d or newer" % AGETTY_MIN, EXIT_MISSING)
+        out = run_command([exe, "--version"]).stdout
+    except OSError as e:
+        raise Fail("can't run %s: %s" % (exe, e), EXIT_MISSING)
     m = re.search(r"(\d+)\.(\d+)", out)
     if not m or (int(m.group(1)), int(m.group(2))) < AGETTY_MIN:
         raise Fail("agetty is too old (%s); ttyskin needs %d.%d or newer"
@@ -570,12 +1074,10 @@ def agetty_ok():
 
 
 def setvtrgb_cmd():
-    if is_test_mode():
-        return "setvtrgb"
-    exe = shutil.which("setvtrgb") or next(
-        (p for p in ("/usr/sbin/setvtrgb", "/sbin/setvtrgb", "/usr/bin/setvtrgb") if os.path.exists(p)), None)
+    exe = system_command("setvtrgb")
     if not exe:
-        raise Fail("setvtrgb not found (it is in the kbd package); needed for palettes", EXIT_MISSING)
+        raise Fail("setvtrgb not found in %s (it is in the kbd package); needed for palettes"
+                   % ", ".join(SYSTEM_DIRS), EXIT_MISSING)
     return exe
 
 
@@ -604,12 +1106,10 @@ def idle_consoles(units_text, who_text):
 def find_idle_consoles():
     if is_test_mode():
         return None
-    try:
-        units = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active",
-                                "getty@tty*.service", "autovt@tty*.service"],
-                               capture_output=True, text=True).stdout
-        who = subprocess.run(["who"], capture_output=True, text=True).stdout
-    except OSError:
+    units = command_output("systemctl", "list-units", "--plain", "--no-legend", "--state=active",
+                           "getty@tty*.service", "autovt@tty*.service")
+    who = command_output("who")
+    if units is None or who is None:
         return None
     return idle_consoles(units, who)
 
@@ -628,17 +1128,33 @@ def clear_consoles(plan):
         return
     for t in ttys:
         try:
-            with open("/dev/" + t, "w") as f:
-                f.write(CLEAR)
+            # never become the console's controlling terminal, never block on it
+            fd = os.open("/dev/" + t, os.O_WRONLY | O_NOCTTY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            try:
+                os.write(fd, CLEAR.encode("ascii"))
+            finally:
+                os.close(fd)
         except OSError as e:
-            print("  (couldn't clear %s: %s)" % (t, e))
+            plan.problem("couldn't clear %s: %s" % (t, e.strerror or e))
 
 
 def reload_gettys(plan):
     clear_consoles(plan)
-    if not plan.run(["agetty", "--reload"], ok_fail=True):
-        print("  The login prompt will show the change the next time it is drawn "
-              "(log out of the console, or reboot).")
+    exe = system_command("agetty")
+    if not exe:
+        plan.problem("agetty not found in %s" % ", ".join(SYSTEM_DIRS))
+    if not exe or not plan.run([exe, "--reload"], ok_fail=True):
+        if not plan.quiet:
+            print("  The login prompt will show the change the next time it is drawn "
+                  "(log out of the console, or reboot).")
+
+
+def watcher_running():
+    """Whether ttyskin-watch.service is active, or None if that can't be told."""
+    if is_test_mode():
+        return None
+    out = command_output("systemctl", "is-active", "ttyskin-watch.service")
+    return None if out is None else out.strip() == "active"
 
 
 def cmd_use(args):
@@ -648,83 +1164,100 @@ def cmd_use(args):
     font = load_font(args)
     errors, warnings = check_piece(piece, font, console_size(args, font))
     for w in warnings:
-        print("warning: " + w)
+        print("warning: " + clean(w))
     if errors:
         for e in errors:
-            print("error: " + e)
+            print("error: " + clean(e))
         raise Fail("%s has %d problem(s); nothing changed" % (piece.name, len(errors)), EXIT_CHECK)
-    state = read_state()
-    if not args.force and not issue_is_ours(state):
-        raise Fail("%s exists and ttyskin didn't write it; move it or use --force" % issue_file(),
-                   EXIT_IN_THE_WAY)
-    pal = piece.palette()
-    # everything the change needs is checked before anything is written
-    exe = setvtrgb_cmd() if (pal or os.path.exists(vtrgb_file())) else None
-    plan = Plan(args.dry_run)
-    issue = to_issue(piece)
-    plan.write(issue_file(), issue)
-    if pal:
-        if not os.path.exists(saved_vtrgb_file()):
-            saved = current_vtrgb()
-            if saved:
-                plan.write(saved_vtrgb_file(), saved)
-        plan.write(vtrgb_file(), palette_to_vtrgb(pal))
-        plan.run([exe, vtrgb_file()])
-    elif os.path.exists(vtrgb_file()):
-        if os.path.exists(saved_vtrgb_file()):
-            plan.run([exe, saved_vtrgb_file()])
-        plan.remove(vtrgb_file())
-    plan.write(state_file(), json.dumps({
-        "piece": piece.name, "from": os.path.abspath(piece.path),
-        "issue_sha256": sha256(issue), "palette": bool(pal),
-        "at": datetime.datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
-    reload_gettys(plan)
+    with contextlib.nullcontext() if args.dry_run else state_lock():
+        state = read_state()
+        if not args.force and not issue_is_ours(state):
+            raise Fail("%s exists and ttyskin didn't write it; move it or use --force" % issue_file(),
+                       EXIT_IN_THE_WAY)
+        pal = piece.palette()
+        # everything the change needs is checked before anything is written
+        exe = setvtrgb_cmd() if (pal or os.path.exists(vtrgb_file())) else None
+        plan = Plan(args.dry_run)
+        keys = address_keys(piece)
+        addresses = current_addresses(keys, lambda m: print("warning: " + m))
+        issue = to_issue(piece, addresses)
+        plan.write(issue_file(), issue)
+        plan.write_current(piece)
+        if pal:
+            if not os.path.exists(saved_vtrgb_file()):
+                saved = current_vtrgb()
+                if saved:
+                    plan.write(saved_vtrgb_file(), saved)
+            plan.write(vtrgb_file(), palette_to_vtrgb(pal))
+            plan.run([exe, vtrgb_file()])
+        elif os.path.exists(vtrgb_file()):
+            if os.path.exists(saved_vtrgb_file()):
+                plan.run([exe, saved_vtrgb_file()])
+            plan.remove(vtrgb_file())
+        plan.write(state_file(), json.dumps({
+            "piece": piece.name, "from": os.path.abspath(piece.path),
+            "issue_sha256": sha256(issue), "addresses": addresses, "palette": bool(pal),
+            "at": datetime.datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
+        reload_gettys(plan)
     if not plan.dry:
         print("%s is in use." % piece.name)
+        if keys and watcher_running() is False:
+            print("ttyskin-watch.service isn't running, so the addresses stay as they are now.")
     return EXIT_OK
 
 
 def cmd_off(args):
     need_root(args.dry_run)
-    state = read_state()
-    exe = setvtrgb_cmd() if os.path.exists(vtrgb_file()) else None
-    plan = Plan(args.dry_run)
-    if os.path.exists(issue_file()):
-        if not args.force and not issue_is_ours(state):
-            raise Fail("%s wasn't written by ttyskin; leaving it (use --force)" % issue_file(), EXIT_IN_THE_WAY)
-        plan.remove(issue_file())
-    if exe:
-        if os.path.exists(saved_vtrgb_file()):
-            plan.run([exe, saved_vtrgb_file()])
-        plan.remove(vtrgb_file())
-    plan.remove(saved_vtrgb_file())
-    plan.remove(state_file())
-    reload_gettys(plan)
+    locked = not args.dry_run and os.path.isdir(state_dir())
+    with state_lock() if locked else contextlib.nullcontext():
+        state = read_state()
+        exe = setvtrgb_cmd() if os.path.exists(vtrgb_file()) else None
+        plan = Plan(args.dry_run)
+        if os.path.exists(issue_file()):
+            if not args.force and not issue_is_ours(state):
+                raise Fail("%s wasn't written by ttyskin; leaving it (use --force)" % issue_file(),
+                           EXIT_IN_THE_WAY)
+            plan.remove(issue_file())
+        if exe:
+            if os.path.exists(saved_vtrgb_file()):
+                plan.run([exe, saved_vtrgb_file()])
+            plan.remove(vtrgb_file())
+        plan.remove(saved_vtrgb_file())
+        plan.remove_current()
+        plan.remove(state_file())
+        reload_gettys(plan)
     if not plan.dry:
         print("ttyskin is off.")
     return EXIT_OK
-
 
 def cmd_list(args):
     pdir = pieces_dir(args)
     current = read_state().get("piece")
     names = list_pieces(pdir)
     if not names:
-        print("no pieces in %s" % pdir)
+        print("no pieces in %s" % clean(pdir))
         return EXIT_OK
     for n in names:
         try:
             t = Piece(pdir, n).title()
         except Fail:
             t = ""
-        print("%s %-24s %s" % ("*" if n == current else " ", n, t))
+        print("%s %-24s %s" % ("*" if n == current else " ", clean(n), clean(t)))
     return EXIT_OK
 
 
 def cmd_show(args):
     piece = Piece(pieces_dir(args), args.name)
+    errors = char_errors(piece)
+    if errors:
+        for e in errors:
+            print("error: " + clean(e))
+        raise Fail("%s has %d problem(s) and isn't shown; run ttyskin check %s"
+                   % (piece.name, len(errors), piece.name), EXIT_CHECK)
     if args.issue:
-        sys.stdout.write(to_issue(piece))
+        def warn(msg):
+            print("ttyskin: " + msg, file=sys.stderr)
+        sys.stdout.write(to_issue(piece, current_addresses(address_keys(piece), warn)))
     else:
         truecolor = os.environ.get("COLORTERM", "") in ("truecolor", "24bit")
         sys.stdout.write(to_terminal(piece, truecolor) + "\x1b[0m")
@@ -737,24 +1270,24 @@ def cmd_check(args):
     size = console_size(args, font)
     errors, warnings = check_piece(piece, font, size)
     for e in errors:
-        print("error: " + e)
+        print("error: " + clean(e))
     for w in warnings:
-        print("warning: " + w)
+        print("warning: " + clean(w))
     if not errors:
         detail = []
         if font:
             detail.append("font %s" % font.path)
         if size:
             detail.append("console %dx%d" % size)
-        print("%s is fine%s." % (piece.name, " (" + ", ".join(detail) + ")" if detail else ""))
+        print("%s is fine%s." % (clean(piece.name), " (" + ", ".join(detail) + ")" if detail else ""))
     return EXIT_CHECK if errors else EXIT_OK
 
 
 def cmd_status(args):
     state = read_state()
-    print("piece:      %s" % (state.get("piece") or "none"))
+    print("piece:      %s" % clean(state.get("piece") or "none"))
     if state.get("from"):
-        print("from:       %s" % state["from"])
+        print("from:       %s" % clean(state["from"]))
     p = issue_file()
     if os.path.exists(p):
         print("art:        %s (%s)" % (p, "written by ttyskin" if issue_is_ours(state) else "NOT written by ttyskin"))
@@ -762,15 +1295,22 @@ def cmd_status(args):
         print("art:        none")
     print("palette:    %s" % (vtrgb_file() if os.path.exists(vtrgb_file()) else "the console's own"))
     print("saved:      %s" % (saved_vtrgb_file() if os.path.exists(saved_vtrgb_file()) else "none"))
-    if not is_test_mode() and shutil.which("systemctl"):
-        r = subprocess.run(["systemctl", "is-enabled", "ttyskin-palette.service"], capture_output=True, text=True)
-        print("boot unit:  ttyskin-palette.service %s" % (r.stdout.strip() or "not installed"))
-    print("pieces:     %s" % pieces_dir(args))
+    if state.get("addresses"):
+        print("addresses:  %s" % clean(", ".join("{%s} %s" % kv for kv in sorted(state["addresses"].items()))))
+    if not is_test_mode():
+        for unit, label in (("ttyskin-palette.service", "boot unit: "), ("ttyskin-watch.service", "watcher:   ")):
+            enabled = command_output("systemctl", "is-enabled", unit)
+            if enabled is None:
+                continue
+            active = command_output("systemctl", "is-active", unit) or ""
+            print("%s %s %s%s" % (label, unit, enabled.strip() or "not installed",
+                                  ", " + active.strip() if enabled.strip() and active.strip() else ""))
+    print("pieces:     %s" % clean(pieces_dir(args)))
     try:
         font = load_font(args)
     except Fail:
         font = None
-    print("font:       %s" % (font.path if font else "not found"))
+    print("font:       %s" % (clean(font.path) if font else "not found"))
     size = console_size(args, font)
     print("console:    %s" % ("%dx%d" % size if size else "unknown"))
     return EXIT_OK
@@ -780,7 +1320,7 @@ def cmd_font_export(args):
     path = args.psf or getattr(args, "font", None) or default_font_path()
     if not path:
         raise Fail("no console font found; give one with --psf", EXIT_MISSING)
-    font = Font(path)
+    font = open_font(path)
     name = re.sub(r"\.psf(\.gz)?$", "", os.path.basename(path)).replace("cached_", "")
     data = json.dumps(font.to_json(name), separators=(",", ":")) + "\n"
     if args.output:
@@ -788,6 +1328,178 @@ def cmd_font_export(args):
         print("wrote %s (%d glyphs, %dx%d)" % (args.output, len(font.glyphs), font.width, font.height))
     else:
         sys.stdout.write(data)
+    return EXIT_OK
+
+# ---------------------------------------------------------------- watch
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def log_problem(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def watch_settle(cfg, problem):
+    """watch_settle= from the config: whole seconds, 1-60."""
+    v = cfg.get("watch_settle")
+    if v is None:
+        return WATCH_SETTLE
+    lo, hi = WATCH_SETTLE_RANGE
+    if re.fullmatch(r"\d{1,3}", v) and lo <= int(v) <= hi:
+        return int(v)
+    problem("watch_settle=%s in %s: use whole seconds, %d-%d; using %d" % (v, config_file(), lo, hi, WATCH_SETTLE))
+    return WATCH_SETTLE
+
+
+def look_at(first_event, last_event, last_redraw, settle,
+            interval=WATCH_INTERVAL, max_wait=WATCH_MAX_WAIT):
+    """When the watcher next looks at the addresses (a time.monotonic() value),
+    or None when nothing has happened since it last looked: `settle` seconds
+    after the last event (but no later than `max_wait` after the first event
+    of a burst, so a steady stream of events can't put it off for ever), and
+    never sooner than `interval` after the last redraw."""
+    if last_event is None:
+        return None
+    t = min(last_event + settle, first_event + max_wait)
+    if last_redraw is not None:
+        t = max(t, last_redraw + interval)
+    return t
+
+
+def watch_look():
+    """One look, under the lock: the piece in use, read from its copy in
+    /etc/ttyskin/current/ (never from the pieces folder), with this machine's
+    addresses. Redraws, as use does, only if an address shown changed and the
+    issue file is still ttyskin's. Returns True if it redrew."""
+    with state_lock():
+        state = read_state()
+        if not state.get("piece") or not os.path.lexists(current_dir()):
+            return False
+        try:
+            piece = Piece(state_dir(), state["piece"], path=current_dir())
+        except Fail:
+            return False
+        if piece.errors:
+            for e in piece.errors:
+                log_problem("the copy of %s: %s" % (state["piece"], e))
+            return False
+        keys = address_keys(piece)
+        if not keys:
+            return False
+        try:
+            found = ifaddrs()
+        except OSError as e:
+            log_problem("can't read the addresses: %s" % e)
+            return False
+        new = shown_addresses(keys, found)
+        changes = address_changes(state.get("addresses") or {}, new)
+        if not changes:
+            return False
+        if not issue_is_ours(state):
+            log_problem("%s wasn't written by ttyskin; leaving it" % issue_file())
+            return False
+        issue = to_issue(piece, new)
+        state.update(issue_sha256=sha256(issue), addresses=new,
+                     at=datetime.datetime.now().isoformat(timespec="seconds"))
+        try:
+            write_atomic(issue_file(), issue)
+            write_atomic(state_file(), json.dumps(state, indent=2) + "\n")
+        except OSError as e:
+            log_problem("can't write %s: %s" % (issue_file(), e))
+            return False
+        log("redraw: " + ", ".join("{%s} %s -> %s" % (k, a or "(none)", b or "(none)") for k, a, b in changes))
+        reload_gettys(Plan(False, quiet=True))
+        return True
+
+
+def drain_events(sock, limit=1000):
+    """Read and discard everything waiting on the event socket; True if
+    anything was there (an overrun counts: events were missed)."""
+    got = False
+    for _ in range(limit):
+        try:
+            data = sock.recv(1 << 16)
+        except BlockingIOError:
+            break
+        except OSError as e:
+            if e.errno == errno.ENOBUFS:
+                got = True
+                continue
+            raise
+        if not data:
+            break
+        got = True
+    return got
+
+
+def prepare_reload_file():
+    """Create agetty's reload trigger file if it is missing, the way agetty
+    does (opened, not touched, so no prompt redraws). The service runs this
+    outside its sandbox, so the file exists to be made writable inside it."""
+    p = syspath(AGETTY_RELOAD_FILE)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        os.close(os.open(p, os.O_RDONLY | os.O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600))
+    except OSError as e:
+        raise Fail("can't create %s: %s" % (p, e), EXIT_MISSING)
+    return EXIT_OK
+
+
+def cmd_watch(args):
+    need_root(False)
+    if args.prepare:
+        return prepare_reload_file()
+    settle = watch_settle(read_config(), log_problem)
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | getattr(socket, "SOCK_CLOEXEC", 0),
+                             socket.NETLINK_ROUTE)
+        sock.bind((0, RTMGRP_LINK | RTMGRP_IPV4_IFADDR))
+        sock.setblocking(False)
+    except (OSError, AttributeError) as e:
+        raise Fail("can't listen for address changes: %s" % e, EXIT_MISSING)
+    stop = []
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w)
+    for s in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(s, lambda signum, frame: stop.append(signum))
+
+    def look():
+        try:
+            return watch_look()
+        except (OSError, Fail) as e:
+            log_problem("look failed: %s" % e)
+            return False
+
+    log("ttyskin %s watching for address changes (settle %ds)" % (VERSION, settle))
+    # addresses may have changed while the watcher wasn't running
+    last_redraw = time.monotonic() if look() else None
+    first = last = None
+    with sock:
+        while not stop:
+            due = look_at(first, last, last_redraw, settle)
+            timeout = None if due is None else max(0.0, due - time.monotonic())
+            ready, _, _ = select.select([sock, wake_r], [], [], timeout)
+            if wake_r in ready:
+                try:
+                    while os.read(wake_r, 64):
+                        pass
+                except BlockingIOError:
+                    pass
+            if stop:
+                break
+            if sock in ready and drain_events(sock):
+                now = time.monotonic()
+                first = now if first is None else first
+                last = now
+            due = look_at(first, last, last_redraw, settle)
+            if due is not None and time.monotonic() >= due:
+                first = last = None
+                if look():
+                    last_redraw = time.monotonic()
+    log("stopped")
     return EXIT_OK
 
 # ---------------------------------------------------------------- main
@@ -820,6 +1532,10 @@ def build_parser():
     s.add_argument("--force", action="store_true", help="remove an issue file ttyskin didn't write")
     s.set_defaults(fn=cmd_off)
     sub.add_parser("status", parents=[common], help="what is in use").set_defaults(fn=cmd_status)
+    s = sub.add_parser("watch", help="keep the addresses in the art current (root; run by ttyskin-watch.service)")
+    s.add_argument("--prepare", action="store_true",
+                   help="only create agetty's reload file if it is missing, then exit (for the service)")
+    s.set_defaults(fn=cmd_watch)
     s = sub.add_parser("font", parents=[common], help="font tools")
     fsub = s.add_subparsers(dest="fcmd", metavar="font-command")
     e = fsub.add_parser("export", help="write the console font as JSON for ttyskin.html")
@@ -838,7 +1554,7 @@ def main(argv=None):
     try:
         return args.fn(args)
     except Fail as f:
-        print("ttyskin: %s" % f, file=sys.stderr)
+        print("ttyskin: %s" % clean(f), file=sys.stderr)
         return f.code
     except BrokenPipeError:
         return EXIT_OK

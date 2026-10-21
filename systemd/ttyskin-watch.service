@@ -1,0 +1,45 @@
+[Unit]
+Description=ttyskin address watcher
+Documentation=https://github.com/donliggett/ttyskin
+After=network.target
+ConditionPathExists=/etc/ttyskin
+
+[Service]
+Type=simple
+# Outside the sandbox ("+"), and allowed to fail ("-"): create agetty's reload
+# file if it is missing, so ReadWritePaths= below can make it writable.
+ExecStartPre=-+/usr/local/bin/ttyskin watch --prepare
+ExecStart=/usr/local/bin/ttyskin watch
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=-/etc/issue.d -/etc/ttyskin -/run/agetty.reload
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+IPAddressDeny=any
+DevicePolicy=closed
+DeviceAllow=char-tty w
+UMask=0022
+MemoryMax=64M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

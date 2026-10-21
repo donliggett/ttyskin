@@ -23,7 +23,7 @@ ttyskin puts color text art on the Linux login console: the text screen a machin
 - The login prompt (`agetty`) prints `/etc/issue` and then every file in `/etc/issue.d/`. ttyskin writes one file there, `/etc/issue.d/ttyskin.issue`. It never edits `/etc/issue`.
 - Color comes from standard escape sequences in that file: 16 colors for text, 8 for backgrounds.
 - A piece can also bring its own palette: the 16 colors themselves. ttyskin sets them with `setvtrgb`, and a small boot unit keeps them across reboots. A palette applies to the whole console, not only to the art.
-- Art can include live values that the login prompt fills in each time it draws: host name, IP address, date, time, logged-in users, terminal name, OS name.
+- Art can include live values: host name, IP address, date, time, logged-in users, terminal name, OS name. The login prompt fills in most of them each time it draws. ttyskin writes IP addresses itself, and a small watcher service, `ttyskin-watch.service`, redraws the prompt when an address on screen actually changes.
 - After a change, ttyskin clears the consoles waiting at a login prompt and asks the prompts to redraw, so the art appears at the top straight away, with no reboot. A console where someone is logged in is never cleared.
 
 ## Requirements
@@ -41,10 +41,13 @@ ttyskin puts color text art on the Linux login console: the text screen a machin
 sudo apt install git kbd
 sudo git clone https://github.com/donliggett/ttyskin.git /opt/ttyskin
 sudo ln -s /opt/ttyskin/ttyskin /usr/local/bin/ttyskin
-sudo cp /opt/ttyskin/systemd/ttyskin-palette.service /etc/systemd/system/
+sudo cp /opt/ttyskin/systemd/ttyskin-palette.service /opt/ttyskin/systemd/ttyskin-watch.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable ttyskin-palette.service
+sudo systemctl enable --now ttyskin-watch.service
 ```
+
+`ttyskin-palette.service` keeps a piece's palette across reboots. `ttyskin-watch.service` keeps IP addresses in the art current; it runs in a tight sandbox, opens no network connections and does nothing while the piece in use has no addresses.
 
 ### Other distributions
 
@@ -52,7 +55,7 @@ Install `git`, Python 3 and the package that provides `setvtrgb` (usually `kbd`)
 
 ### After installing
 
-- **Update:** `sudo git -C /opt/ttyskin pull`.
+- **Update:** `sudo git -C /opt/ttyskin pull`, then `sudo systemctl restart ttyskin-watch.service`.
 - **Your own pieces:** keep them in any folder and point ttyskin at it, either with `--dir` or once for all commands:
 
   ```sh
@@ -61,6 +64,18 @@ Install `git`, Python 3 and the package that provides `setvtrgb` (usually `kbd`)
   ```
 
   Without that, ttyskin uses `/opt/ttyskin/pieces`, which holds the sample.
+
+### Upgrading from 0.3
+
+0.4 writes IP addresses into the art itself instead of leaving them to the login prompt, which redrew the whole screen on every network event. After pulling, add the watcher and reinstall the piece in use, so ttyskin keeps its own copy of it:
+
+```sh
+sudo git -C /opt/ttyskin pull
+sudo cp /opt/ttyskin/systemd/ttyskin-watch.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ttyskin-watch.service
+sudo ttyskin use <piece>
+```
 
 ## Use
 
@@ -83,10 +98,13 @@ ttyskin status
 | `off` | removes the art, restores the palette saved before the first `use`, and redraws (root) |
 | `status` | the piece in use, the palette, the font, the console's size |
 | `font export` | writes the console font as JSON, for loading into the page |
+| `watch` | keeps IP addresses in the art current; run by `ttyskin-watch.service` (root) |
 
 Options for every command: `--dir <folder>` (where the pieces are), `--font <file>` (a `.psf`, `.psf.gz` or exported `.json`), `--size <columns>x<rows>`. `use` and `off` also take `--dry-run` and `--force`.
 
 The pieces folder is, in order: `--dir`, the `TTYSKIN_PIECES` environment variable, `pieces_dir=` in `/etc/ttyskin/config`, or the `pieces` folder next to the command.
+
+`ttyskin show` and `ttyskin use` refuse a piece with characters that can't be drawn (control characters, invisible formatting characters, double-width characters), and ttyskin never follows links inside a piece.
 
 Exit codes: `0` done, `1` the piece failed its check, `2` usage, `3` needs root, `4` something the machine lacks, `5` a file ttyskin didn't write is in the way.
 
@@ -103,7 +121,7 @@ pieces/<name>/
   piece.json    {"title", "author", "license", "notes"}                  (optional)
 ```
 
-`fg.txt` and `bg.txt` have the same shape as `art.txt`. Live values are written in `art.txt` as `{host}`, `{ipv4}`, `{ipv4:eth0}`, `{date}`, `{time}`, `{users}`, `{tty}` and `{os}`; each takes the color of its first cell. Other text in braces is drawn as written.
+`fg.txt` and `bg.txt` have the same shape as `art.txt`. Live values are written in `art.txt` as `{host}`, `{ipv4}`, `{ipv4:eth0}`, `{date}`, `{time}`, `{users}`, `{tty}` and `{os}`; each takes the color of its first cell. Other text in braces is drawn as written. An interface without an IPv4 address shows `-`.
 
 Only the sample piece is tracked by git; other folders in `pieces/` are ignored, so your own art stays yours. `pieces/sample` is the wordmark above, with a palette and two live values.
 
@@ -135,8 +153,9 @@ Transparent parts of the picture get no background color. The result is a normal
 
 ```sh
 sudo ttyskin off
+sudo systemctl disable --now ttyskin-watch.service
 sudo systemctl disable ttyskin-palette.service
-sudo rm /etc/systemd/system/ttyskin-palette.service /usr/local/bin/ttyskin
+sudo rm /etc/systemd/system/ttyskin-palette.service /etc/systemd/system/ttyskin-watch.service /usr/local/bin/ttyskin
 sudo rm -r /etc/ttyskin /opt/ttyskin
 ```
 

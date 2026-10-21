@@ -52,17 +52,19 @@ The **Check** panel lists anything the console can't show: characters missing fr
 
 ## 4. Live values
 
-Live values are filled in by the machine every time the login prompt is drawn:
+Live values are filled in on the machine. The login prompt fills in most of them every time it is drawn; ttyskin fills in the IP addresses itself (see below):
 
 | Write | Shows |
 |---|---|
 | `{host}` | the host name |
-| `{ipv4}` | the first IPv4 address |
-| `{ipv4:eth0}` | the IPv4 address of one interface (use your interface's name) |
+| `{ipv4}` | the first IPv4 address: the first global address on an interface that is up and not loopback |
+| `{ipv4:eth0}` | the first IPv4 address of one interface (use your interface's name) |
 | `{date}`, `{time}` | the date and time |
 | `{users}` | the number of logged-in users |
 | `{tty}` | the terminal's name, like `tty1` |
 | `{os}` | the OS name |
+
+**Addresses are written by ttyskin and kept current by the watcher.** `ttyskin use` writes each address into the art as text. Then `ttyskin-watch.service` (see the README) listens for address changes; when an address shown on screen actually changes, it waits a few seconds for things to settle and redraws the login prompt, at most once every 10 seconds. A Wi-Fi reconnect that comes back with the same address redraws nothing. An interface without an IPv4 address shows `-`. Without the watcher, the addresses stay as they were at the last `use`.
 
 To add one, choose the **Text** tool, click where it should start, and pick it from **insert live value…** (or type it). The value takes the colors of the token's first cell; to color it, paint that cell.
 
@@ -111,7 +113,7 @@ sudo ttyskin use <name>
 
 - **Switch:** run `use` with another piece.
 - **Turn it off:** `sudo ttyskin off` removes the art and restores the palette the console had before ttyskin first changed it.
-- **See what's in use:** `ttyskin status`.
+- **See what's in use:** `ttyskin status`, including the addresses on screen and whether the watcher is running.
 
 ## 7. Keys
 
