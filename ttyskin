@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 EXIT_OK, EXIT_CHECK, EXIT_USAGE, EXIT_ROOT, EXIT_MISSING, EXIT_IN_THE_WAY = 0, 1, 2, 3, 4, 5
 

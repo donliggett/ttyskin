@@ -1,6 +1,6 @@
 # ttyskin: specification
 
-Status: version 0.2, built and checked on a real console (§6).
+Status: version 0.3, built and checked on a real console (§6); the image import is new in 0.3.
 
 ttyskin puts colour text art on the Linux login console (the text screen a machine shows after boot, before anyone logs in) and lets you switch between pieces of art. It has two parts:
 
@@ -67,6 +67,7 @@ Requires Python 3.8 or newer (standard library only), util-linux `agetty` 2.36+,
 - **Open folder** (Chrome, Edge): pick a pieces folder or one piece's folder; dropping a folder on the page does the same. **Save** (Ctrl+S) writes `art.txt`, `fg.txt`, `bg.txt`, `palette.txt` and `piece.json` back into the piece's folder, and deletes `fg.txt`, `bg.txt` or `palette.txt` when the piece no longer has them.
 - **Open read-only** (any browser): reads a folder; **Download** saves the current piece as a `.zip` of its files.
 - **New** and **Duplicate** make a piece (a new folder when a pieces folder is open).
+- **Import image…** turns a picture into a piece (below); dropping an image file on the page does the same.
 - **View:**
   - The piece drawn with the console's bitmap font, in its palette, the Linux default palette or Ubuntu's.
   - The art alone (with room around it to keep drawing), or the whole console at its size in columns and rows, with a sample distribution line, the art, and the login prompt below it.
@@ -86,7 +87,23 @@ Requires Python 3.8 or newer (standard library only), util-linux `agetty` 2.36+,
 - **Font:** the page includes the 8×16 Uni2 Fixed console font. **Font…** loads another: a `ttyskin font export` file, or a `.psf` / `.psf.gz` directly.
 - **Console size:** presets (80×25, 160×50, 240×67, 320×90) or columns and rows typed in.
 
-Later, not in this version: turning an image into a piece in the page.
+### Image import
+
+**Import image…** (or an image file dropped on the page: anything the browser decodes, such as PNG, JPEG, WebP, GIF or SVG) opens a dialog with a live preview drawn in the console font, at the dialog's width (up to 2×), 1× or 2×. The result is an ordinary piece, to finish by hand.
+
+- **Width** in columns. It starts at the smaller of the console's columns and the picture's width divided by the font's cell width. The height follows the picture's shape, allowing for the cell's: rows = columns × height / width × cell width / cell height. A picture taller than the console is capped at the console's rows (and the width shrinks to keep its shape); the dialog says so.
+- **Palette:** *from the image* (the default), *this piece's palette* (when the open piece has one), *Linux default* or *Ubuntu default*.
+- **Characters:** *blocks* (space `█ ░ ▒ ■ ▮`); *blocks and lines*, which adds shapes that carry edges in an 8×16 console font (`─ │ ═ ║ ┼ ├ ┤ ┬ ┴ ┌ ┐ └ ┘ ╭ ╮ ╰ ╯ ╱ ╲ ╳ / \ _ ‗ ¯ · . • ●`); or *every character in the font*, which is slow and warns above 80 columns. Only characters the loaded font has are used, and never `{` or `}`, combining marks or other characters that don't take one cell.
+- **Into:** *a new piece* (named like **New**, with its own folder when a pieces folder is open) or *replace this piece* (one undo restores the art and the palette).
+- Afterwards View shows the piece in the palette it was made for: the piece's palette for *from the image* and *this piece's palette*; *Linux default* or *Ubuntu default* leave the piece without `palette.txt` (the console's own colours) and select that palette in View.
+
+How it chooses:
+
+1. The picture is drawn at exactly one font cell of pixels per cell (columns × cell width by rows × cell height), smoothed when shrinking; when enlarging (pixel art) it keeps hard pixels. Pixels under 50% opacity are transparent.
+2. **Palette from the image:** a picture with 16 colours or fewer keeps its own colours (near copies merged). Otherwise k-means in OKLab on a sample of the pixels finds 16, then near copies are merged and small clusters that are only the blend along an edge between two bigger colours are dropped. The 8 colours with the most area go in slots 0–7 (only those can be backgrounds), the rest in 8–15. Slot 0, the console's background, is the darkest colour; it is black when the picture's darkest colour isn't dark, or when the picture has transparent parts and no colour near black. Slot 7, the console's text colour, is the colour most readable on slot 0, and is lightened until it has a contrast ratio of at least 4.5:1 with slot 0. Slots the picture doesn't need keep the Linux default colours and aren't used in the art.
+3. **Each cell:** for each candidate character, the glyph splits the cell's pixels into its "on" and "off" pixels. The text colour (any slot) is the one nearest the "on" pixels' mean, the background (slots 0–7, or none) the one nearest the "off" pixels' mean, and the character whose choice has the least sum of squared OKLab distances, pixel by pixel, wins. A transparent pixel counts as showing slot 0, and colouring it costs a little more, so transparent areas get no background colour and a fully transparent cell is a space.
+
+The output uses only `0`–`f` for text, `0`–`7` for backgrounds and characters in the font, so it passes `ttyskin check` against that font.
 
 ## 5. Repository layout
 
@@ -106,7 +123,7 @@ Install is a clone and a link: the clone in `/opt/ttyskin`, the command linked i
 
 ## 6. Checked
 
-In development: the command's behaviour against a stand-in root (31 tests, Python 3.13 and 3.14), the page in headless Chromium (rendering, editing, saving into a folder), the default font's licence.
+In development: the command's behaviour against a stand-in root (31 tests, Python 3.13 and 3.14), the page in headless Chromium (rendering, editing, saving into a folder), the default font's licence. The image import (0.3) in headless Chromium and Edge: imports of a logo, a photo and a sprite at 64 to 320 columns pass `ttyskin check`, with no network requests.
 
 On a real console (Ubuntu 26.04, util-linux 2.41.3, systemd 259, 2560×1440 framebuffer, 2026-10-20):
 

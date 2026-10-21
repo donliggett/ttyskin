@@ -57,6 +57,11 @@ dialog::backdrop { background: rgba(0,0,0,.6); }
 dialog input { width: 260px; }
 label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
 kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; color: var(--dim); }
+#impDlg { width: min(1180px, 94vw); }
+#impDlg input[type=number] { width: 72px; }
+#impView { overflow: auto; max-height: 62vh; background: #000; border: 1px solid var(--line); margin: 8px 0; }
+#impCanvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+#impCap { color: var(--accent2); }
 @media (max-width: 800px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; } aside { max-height: 45vh; border-left: 0; border-top: 1px solid var(--line); } }
 </style>
 </head>
@@ -74,6 +79,8 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-si
   <select id="pieceName"></select>
   <button id="next" title="Next piece (→)">▶</button>
   <button id="newPiece">New</button>
+  <button id="importImg" title="Turn a picture into a piece (or drop an image on the page)">Import image…</button>
+  <input id="imgInput" type="file" accept="image/*,.svg" hidden>
   <button id="dupPiece">Duplicate</button>
   <button id="save" title="Save (Ctrl+S)">Save</button>
   <button id="zip" title="Download the piece as a .zip">Download</button>
@@ -180,9 +187,28 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-si
 
 <dialog id="nameDlg"><form method="dialog">
   <p id="nameDlgTitle">Name the piece</p>
-  <p><input id="nameInput" pattern="[a-z0-9][a-z0-9-]*" required placeholder="lowercase-with-dashes"></p>
+  <p><input id="nameInput" pattern="[a-z0-9][a-z0-9\-]*" required placeholder="lowercase-with-dashes"></p>
   <p class="note">Lowercase letters, digits and dashes.</p>
   <p class="row"><button value="ok">OK</button><button value="cancel" formnovalidate>Cancel</button></p>
+</form></dialog>
+
+<dialog id="impDlg"><form method="dialog">
+  <p>Import image <span class="note" id="impName"></span></p>
+  <div id="impView"><canvas id="impCanvas"></canvas></div>
+  <div class="row">
+    <label title="Width in columns; the height follows the picture's shape">width <input type="number" id="impW" min="1"></label>
+    <span>columns × <span id="impH">—</span> rows</span> <span id="impCap"></span>
+  </div>
+  <div class="row">
+    <label>palette <select id="impPal"><option value="image">from the image</option><option value="piece">this piece's palette</option><option value="linux">Linux default</option><option value="ubuntu">Ubuntu default</option></select></label>
+    <label>characters <select id="impChars"><option value="blocks">blocks</option><option value="lines">blocks and lines</option><option value="all">every character in the font</option></select></label>
+  </div>
+  <div class="row">
+    <label>into <select id="impInto"><option value="new">a new piece</option><option value="replace">replace this piece</option></select></label>
+    <label>preview <select id="impZoom"><option value="fit">fit</option><option value="1">1×</option><option value="2">2×</option></select></label>
+  </div>
+  <p class="note" id="impInfo"></p>
+  <p class="row"><button value="ok" id="impOk">Import</button><button value="cancel" formnovalidate>Cancel</button></p>
 </form></dialog>
 
 <script>
@@ -428,9 +454,15 @@ async function addPiece(base) {
   const files = base ? pieceFiles(base) : { "art.txt": "" };
   const p = makePiece(name, files, null);
   if (base) { p.palette = base.palette && base.palette.slice(); p.meta = base.meta && JSON.parse(JSON.stringify(base.meta)); }
-  if (S.root && !S.readOnly) { try { p.handle = await S.root.getDirectoryHandle(name, { create: true }); } catch (e) { msg("couldn't create the folder: " + e.message, true); } }
+  await joinPieces(p);
+  msg((base ? "duplicated as " : "new piece ") + name + (p.handle ? " (Save to write it)" : " (Download to keep it)"));
+}
+
+// A new piece joins the list, with its own folder when a pieces folder is open.
+async function joinPieces(p) {
+  if (S.root && !S.readOnly) { try { p.handle = await S.root.getDirectoryHandle(p.name, { create: true }); } catch (e) { msg("couldn't create the folder: " + e.message, true); } }
   p.dirty = true; S.pieces.push(p); S.pieces.sort((a, b) => a.name.localeCompare(b.name)); S.idx = S.pieces.indexOf(p);
-  afterPieceChange(); msg((base ? "duplicated as " : "new piece ") + name + (p.handle ? " (Save to write it)" : " (Download to keep it)"));
+  afterPieceChange();
 }
 
 // ------------------------------------------------------------ undo
@@ -523,12 +555,16 @@ function drawScreen() {
 }
 
 function drawCell(cell, r, c, pal) {
-  const F = S.font, W = IMG.width, d = IMG.data;
+  const F = S.font;
   let ch = " ", fg = 7, bg = 0;
   if (cell) { ch = cell.ch; if (cell.fg >= 0) fg = cell.fg; if (cell.bg >= 0) bg = cell.bg; }
   const cp = ch.codePointAt(0); let gi = F.map.get(cp);
   if (gi === undefined) { gi = F.repl; if (cell && cell.gr >= 0) S.missing.set(cell.gr + ":" + cell.gc, ch); }
-  const glyph = F.glyphs[gi], f = pal[fg], b = pal[bg];
+  paintGlyph(IMG, F, F.glyphs[gi], pal[fg], pal[bg], r, c);
+}
+
+function paintGlyph(img, F, glyph, f, b, r, c) {
+  const W = img.width, d = img.data;
   for (let y = 0; y < F.h; y++) {
     let o = ((r * F.h + y) * W + c * F.w) * 4;
     for (let x = 0; x < F.w; x++, o += 4) {
@@ -812,6 +848,320 @@ function onUp() {
   renderChrome();
 }
 
+// ------------------------------------------------------------ image import
+// Colours are compared in OKLab, where distance follows what the eye sees.
+const LIN = Float64Array.from({ length: 256 }, (_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); });
+function labInto(out, j, r, g, b) { // linear sRGB → OKLab
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  out[j] = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s;
+  out[j + 1] = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+  out[j + 2] = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+}
+function rgbLab(rgb) { const o = [0, 0, 0]; labInto(o, 0, LIN[rgb[0]], LIN[rgb[1]], LIN[rgb[2]]); return o; }
+function dist2(a, b) { const x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2]; return x * x + y * y + z * z; }
+function rgbHex(rgb) { return "#" + rgb.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join(""); }
+function luminance(hex) { const [r, g, b] = hexRgb(hex); return 0.2126 * LIN[r] + 0.7152 * LIN[g] + 0.0722 * LIN[b]; }
+function contrast(a, b) { const x = luminance(a), y = luminance(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+function popcnt(x) { x -= (x >>> 1) & 0x55555555; x = (x & 0x33333333) + ((x >>> 2) & 0x33333333); return Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24; }
+const yieldNow = () => new Promise(res => { if (!document.hidden) return setTimeout(res, 0); const ch = new MessageChannel(); ch.port1.onmessage = () => res(); ch.port2.postMessage(0); });
+
+const IMPORT_CHARS = {
+  blocks: " █░▒■▮",
+  // shapes that carry edges in this kind of font: lines at the cell's middle, top and bottom, corners, tees, diagonals, dots
+  lines: " █░▒■▮─│═║┼├┤┬┴┌┐└┘╭╮╰╯╱╲╳/\\_‗¯·.•●",
+};
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+function isImageFile(f) { return !!f && ((f.type || "").startsWith("image/") || IMAGE_RE.test(f.name || "")); }
+function slugName(s) { return (s || "").replace(/\.[^.]*$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "image"; }
+function freeName(base) { let n = base, k = 2; while (S.pieces.some(p => p.name === n)) n = base + "-" + k++; return n; }
+
+async function loadImage(src) {
+  let blob = null, name = "image", url = src;
+  if (src instanceof Blob) { blob = src; name = src.name || name; }
+  else if (typeof src === "string") {
+    if (!/^(data|blob):/.test(src)) { name = decodeURIComponent(src.split(/[?#]/)[0].split("/").pop() || name); try { const r = await fetch(src); if (r.ok) blob = await r.blob(); } catch (e) {} }
+  } else throw new Error("give a URL, a Blob or a data URL");
+  if (blob) url = URL.createObjectURL(blob);
+  const el = new Image(); el.src = url;
+  try { await el.decode(); } catch (e) { if (blob) URL.revokeObjectURL(url); throw new Error("the browser can't decode it as an image"); }
+  let w = el.naturalWidth, h = el.naturalHeight; if (!w || !h) { w = 512; h = 512; } // an SVG without a size
+  return { el, w, h, name, url: blob ? url : null };
+}
+
+function importSize(im, width) {
+  const F = S.font, aspect = im.h / im.w * F.w / F.h;
+  let cols = Math.max(1, Math.min(S.cols, Math.round(width) || 1)), rows = Math.max(1, Math.round(cols * aspect)), capped = "";
+  if (width > S.cols) capped = `capped at ${S.cols} columns, the console's width`;
+  if (rows > S.rows) { rows = S.rows; cols = Math.max(1, Math.min(cols, Math.round(rows / aspect))); capped = `capped at ${rows} rows, the console's height (so ${cols} columns)`; }
+  return { cols, rows, capped };
+}
+function defaultWidth(im) { return Math.max(1, Math.min(S.cols, Math.floor(im.w / S.font.w))); }
+
+// The picture at exactly one font cell of pixels per cell.
+function sampleImage(im, W, H) {
+  let src = im.el, sw = im.w, sh = im.h; const down = W < sw || H < sh;
+  while (down && sw >= W * 4 && sh >= H * 4) { // halve big pictures first so every pixel counts
+    const c = document.createElement("canvas"); c.width = Math.ceil(sw / 2); c.height = Math.ceil(sh / 2);
+    const x = c.getContext("2d"); x.imageSmoothingEnabled = true; x.imageSmoothingQuality = "high"; x.drawImage(src, 0, 0, c.width, c.height);
+    src = c; sw = c.width; sh = c.height;
+  }
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const x = c.getContext("2d", { willReadFrequently: true });
+  // smoothing when shrinking; enlarging (pixel art) keeps hard pixels
+  x.imageSmoothingEnabled = down; x.imageSmoothingQuality = "high"; x.drawImage(src, 0, 0, W, H);
+  try { return x.getImageData(0, 0, W, H).data; } catch (e) { throw new Error("the browser won't let the page read that image; open it as a file"); }
+}
+
+// 16 colours from the picture: its own colours when it has 16 or fewer, else k-means in OKLab.
+function imagePalette(data) {
+  const counts = new Map(); let opaque = 0;
+  for (let o = 0; o < data.length; o += 4) if (data[o + 3] >= 128) {
+    opaque++; if (counts.size <= 16) { const k = (data[o] << 16) | (data[o + 1] << 8) | data[o + 2]; counts.set(k, (counts.get(k) || 0) + 1); } }
+  let cols;
+  if (counts.size <= 16) cols = mergeTwins([...counts].map(([k, w]) => { const rgb = [k >> 16, (k >> 8) & 255, k & 255]; return { hex: rgbHex(rgb), lab: rgbLab(rgb), w }; }));
+  else cols = kmeans(data, opaque);
+  cols.sort((a, b) => b.w - a.w);
+  return arrangePalette(cols, opaque < data.length / 4);
+}
+
+// Merge colours the eye can't tell apart into the one with more area.
+function mergeTwins(cl) {
+  cl.sort((a, b) => a.w - b.w);
+  for (let i = 0; i < cl.length; i++) {
+    const c = cl[i], twin = cl.slice(i + 1).find(o => dist2(o.lab, c.lab) < 0.0009);
+    if (twin) { twin.w += c.w; cl.splice(i--, 1); }
+  }
+  return cl;
+}
+
+function kmeans(data, opaque, K = 16) {
+  const step = Math.max(1, Math.floor(opaque / 30000)), pts = [], rgbs = [];
+  for (let o = 0, i = 0; o < data.length; o += 4) if (data[o + 3] >= 128 && i++ % step === 0) { pts.push(rgbLab([data[o], data[o + 1], data[o + 2]])); rgbs.push(o); }
+  const N = pts.length; let seed = 0x9e3779b9;
+  const rand = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t ^= t + Math.imul(t ^ (t >>> 7), 61 | t); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  // k-means++ seeding (seeded, so the same picture gives the same palette)
+  const C = [pts[N >> 1].slice()], d = new Float64Array(N).fill(Infinity);
+  while (C.length < K) {
+    let sum = 0; const last = C[C.length - 1];
+    for (let j = 0; j < N; j++) { d[j] = Math.min(d[j], dist2(pts[j], last)); sum += d[j]; }
+    if (sum <= 0) break;
+    let t = rand() * sum, j = 0; for (; j < N - 1; j++) { t -= d[j]; if (t <= 0) break; }
+    C.push(pts[j].slice());
+  }
+  const asg = new Int32Array(N).fill(-1);
+  for (let it = 0; it < 20; it++) {
+    let moved = 0; const sums = C.map(() => [0, 0, 0, 0]);
+    for (let j = 0; j < N; j++) { let best = Infinity, bk = 0;
+      for (let k = 0; k < C.length; k++) { const v = dist2(pts[j], C[k]); if (v < best) { best = v; bk = k; } }
+      if (asg[j] !== bk) { asg[j] = bk; moved++; } const s = sums[bk]; s[0] += pts[j][0]; s[1] += pts[j][1]; s[2] += pts[j][2]; s[3]++; }
+    sums.forEach((s, k) => { if (s[3]) C[k] = [s[0] / s[3], s[1] / s[3], s[2] / s[3]]; });
+    if (!moved) break;
+  }
+  let cl = C.map(() => ({ rgb: [0, 0, 0], w: 0 }));
+  for (let j = 0; j < N; j++) { const c = cl[asg[j]], o = rgbs[j]; c.w++; c.rgb[0] += data[o]; c.rgb[1] += data[o + 1]; c.rgb[2] += data[o + 2]; }
+  cl = cl.filter(c => c.w).map(c => { const rgb = c.rgb.map(v => v / c.w); return { hex: rgbHex(rgb), lab: rgbLab(hexRgb(rgbHex(rgb))), w: c.w }; });
+  // Merge near copies, then drop small clusters that are only the blend along an edge between two bigger colours.
+  mergeTwins(cl);
+  for (let i = 0; i < cl.length; i++) {
+    const c = cl[i]; if (c.w > N * 0.02) break;
+    const big = cl.slice(i + 1); let gone = null;
+    outer: for (let a = 0; a < big.length; a++) for (let b = a + 1; b < big.length; b++) {
+      const A = big[a].lab, B = big[b].lab, ab = [B[0] - A[0], B[1] - A[1], B[2] - A[2]], L2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+      if (!L2) continue; const t = ((c.lab[0] - A[0]) * ab[0] + (c.lab[1] - A[1]) * ab[1] + (c.lab[2] - A[2]) * ab[2]) / L2;
+      if (t > 0.05 && t < 0.95 && dist2(c.lab, [A[0] + t * ab[0], A[1] + t * ab[1], A[2] + t * ab[2]]) < 0.0009) { gone = big.reduce((m, o) => dist2(o.lab, c.lab) < dist2(m.lab, c.lab) ? o : m); break outer; }
+    }
+    if (gone) { gone.w += c.w; cl.splice(i--, 1); }
+  }
+  return cl;
+}
+
+// Console slot order: the 8 colours with the most area in slots 0-7 (the only ones usable as backgrounds),
+// the darkest in slot 0 (the console's background), the most readable on it in slot 7 (its text).
+// Slot 0 is black when the picture is too light for it, or has transparent parts and no colour near black
+// (transparent cells show slot 0, so a dark colour of the picture there would merge into them).
+function arrangePalette(cols, transparent) {
+  const lin = PALETTES.linux, slots = new Array(16).fill(null);
+  cols = cols.slice(0, 16);
+  let dark = cols.reduce((m, c) => !m || c.lab[0] < m.lab[0] ? c : m, null);
+  if (!dark || dark.lab[0] > (transparent ? 0.08 : 0.3)) { if (cols.length === 16) cols.pop(); dark = { hex: "#000000", filler: true }; }
+  else cols = cols.filter(c => c !== dark);
+  slots[0] = dark;
+  const top = cols.slice(0, 7), rest = cols.slice(7);
+  let s7 = top.reduce((m, c) => !m || contrast(c.hex, dark.hex) > contrast(m.hex, dark.hex) ? c : m, null);
+  if (s7 && (top.length === 7 || contrast(s7.hex, dark.hex) >= 4.5)) top.splice(top.indexOf(s7), 1);
+  else s7 = { hex: lin[7], filler: true }; // a spare slot: keep the console's own light grey for text
+  slots[7] = s7;
+  top.forEach((c, i) => slots[1 + i] = c); rest.forEach((c, i) => slots[8 + i] = c);
+  // slots the picture doesn't need keep the Linux default and aren't used for the art
+  const pal = slots.map((c, i) => c ? c.hex : lin[i]), usable = slots.map(c => !!c && !c.filler);
+  for (let n = 0; n < 60 && contrast(pal[7], pal[0]) < 4.5; n++) pal[7] = rgbHex(hexRgb(pal[7]).map(v => v + (255 - v) * 0.08));
+  return { pal, usable };
+}
+
+let impGlyphs = null;
+function importGlyphs(kind) {
+  const F = S.font; if (impGlyphs && impGlyphs.font === F && impGlyphs.kind === kind) return impGlyphs.list;
+  const chars = kind === "all" ? [...IMPORT_CHARS.lines, ...[...F.map.keys()].sort((a, b) => a - b).map(cp => String.fromCodePoint(cp))] : [...IMPORT_CHARS[kind] || IMPORT_CHARS.blocks];
+  const n = F.w * F.h, words = (n + 31) >> 5, seen = new Set(), list = [];
+  for (const ch of chars) {
+    const cp = ch.codePointAt(0); let g = null;
+    if (ch !== " ") { // only characters that take one cell; no braces, so no accidental live values
+      if (cp < 33 || cp === 127 || /[\p{M}\p{Cf}\p{Cc}\p{Z}\p{Co}{}]/u.test(ch)) continue;
+      const gi = F.map.get(cp); if (gi === undefined) continue; g = F.glyphs[gi]; }
+    const mask = new Uint32Array(words), on = [];
+    if (g) for (let y = 0; y < F.h; y++) for (let x = 0; x < F.w; x++) if (g[y * F.bpr + (x >> 3)] & (0x80 >> (x & 7))) { const i = y * F.w + x; on.push(i * 3); mask[i >> 5] |= 1 << (i & 31); }
+    const key = mask.join(","); if (seen.has(key)) continue; seen.add(key);
+    list.push({ ch, on: Int32Array.from(on), mask, nOn: on.length });
+  }
+  impGlyphs = { font: F, kind, list };
+  return list;
+}
+
+// Turn the picture into cells. For each cell and character, the glyph splits the cell's pixels into "on" and "off";
+// the text colour is the slot nearest the "on" pixels' mean, the background the slot (0-7, or none) nearest the "off"
+// pixels' mean, and the character with the least summed squared distance wins. Sums make this cheap:
+// sum |p - c|^2 over a set = sum |p|^2 + n|c|^2 - 2 c·sum p, and the first term is the same for every choice.
+async function convertImage(im, opts, progress, cancelled) {
+  const t0 = performance.now(), F = S.font, n = F.w * F.h, words = (n + 31) >> 5;
+  const { cols, rows, capped } = importSize(im, opts.width);
+  const data = sampleImage(im, cols * F.w, rows * F.h);
+  let pal, usable = new Array(16).fill(true);
+  if (opts.palette === "image") ({ pal, usable } = imagePalette(data));
+  else if (opts.palette === "piece") { const p = cur(); if (!p || !p.palette) throw new Error("this piece has no palette"); pal = p.palette.slice(); }
+  else if (PALETTES[opts.palette]) pal = PALETTES[opts.palette].slice();
+  else throw new Error("palette is image, piece, linux or ubuntu");
+  const P = pal.map(h => rgbLab(hexRgb(h))), P2 = P.map(c => c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+  const T = P.map(c => dist2(c, P[0]) + 0.05); // a transparent pixel shows slot 0; colouring it costs a little more than that
+  const fgS = [...Array(16).keys()].filter(k => usable[k]), bgS = fgS.filter(k => k < 8);
+  const glyphs = importGlyphs(opts.chars), grid = newGrid(cols, rows), W = cols * F.w;
+  const lab = new Float64Array(n * 3), tm = new Uint32Array(words);
+  let tick = performance.now();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      tm.fill(0); let tc = 0, Sx = 0, Sy = 0, Sz = 0;
+      for (let y = 0; y < F.h; y++) {
+        let o = ((r * F.h + y) * W + c * F.w) * 4;
+        for (let x = 0; x < F.w; x++, o += 4) {
+          const i = y * F.w + x, j = i * 3;
+          if (data[o + 3] < 128) { tm[i >> 5] |= 1 << (i & 31); tc++; lab[j] = lab[j + 1] = lab[j + 2] = 0; }
+          else { labInto(lab, j, LIN[data[o]], LIN[data[o + 1]], LIN[data[o + 2]]); Sx += lab[j]; Sy += lab[j + 1]; Sz += lab[j + 2]; }
+        }
+      }
+      const nOp = n - tc; let best = Infinity, bch = " ", bfg = -1, bbg = -1, bfull = false;
+      for (const g of glyphs) {
+        const on = g.on; let ax = 0, ay = 0, az = 0;
+        for (let k = 0; k < on.length; k++) { const j = on[k]; ax += lab[j]; ay += lab[j + 1]; az += lab[j + 2]; }
+        let t1 = 0; if (tc) for (let w = 0; w < words; w++) t1 += popcnt(g.mask[w] & tm[w]);
+        const n1 = g.nOn - t1, n0 = nOp - n1, t0 = tc - t1, bx = Sx - ax, by = Sy - ay, bz = Sz - az;
+        let fv = 0, fk = -1, bv = 0, bk = -1;
+        if (g.nOn) { fv = Infinity;
+          for (const k of fgS) { const p = P[k], v = n1 * P2[k] - 2 * (p[0] * ax + p[1] * ay + p[2] * az) + t1 * T[k]; if (v < fv) { fv = v; fk = k; } } }
+        if (g.nOn < n) { const p = P[0]; bv = tc ? n0 * P2[0] - 2 * (p[0] * bx + p[1] * by + p[2] * bz) : Infinity; // none: shows slot 0
+          for (const k of bgS) { const p = P[k], v = n0 * P2[k] - 2 * (p[0] * bx + p[1] * by + p[2] * bz) + t0 * T[k]; if (v < bv) { bv = v; bk = k; } } }
+        if (fv + bv < best) { best = fv + bv; bch = g.ch; bfg = fk; bbg = bk; bfull = g.nOn === n; }
+      }
+      const i = r * cols + c;
+      if (bch === " " || (bfg === bbg && bfg >= 0)) { grid.ch[i] = " "; grid.bg[i] = bbg; } // a character in one colour is a coloured space
+      else { grid.ch[i] = bch; grid.fg[i] = bfg; grid.bg[i] = bfull ? -1 : bbg; }
+    }
+    if (performance.now() - tick > 40) {
+      if (progress) progress(Math.round(100 * (r + 1) / rows)); await yieldNow();
+      if (cancelled && cancelled()) return null; tick = performance.now();
+    }
+  }
+  const used = new Set(); for (let i = 0; i < grid.ch.length; i++) { if (grid.ch[i] !== " " && grid.fg[i] >= 0) used.add(grid.fg[i]); if (grid.bg[i] >= 0) used.add(grid.bg[i]); }
+  return { grid, pal, mode: opts.palette, cols, rows, capped, colours: used.size, ms: Math.round(performance.now() - t0) };
+}
+
+async function applyImport(res, into, name) {
+  const g = res.grid; let p;
+  if (into === "replace") {
+    p = cur(); if (!p) throw new Error("no piece to replace");
+    pushUndo(); // one step restores the art and the palette
+    p.grid = { w: g.w, h: g.h, ch: g.ch.slice(), fg: g.fg.slice(), bg: g.bg.slice() };
+    if (res.mode === "image") p.palette = res.pal.slice(); else if (res.mode !== "piece") p.palette = null;
+  } else {
+    if (!NAME_RE.test(name || "")) throw new Error("use lowercase letters, digits and dashes");
+    if (S.pieces.some(q => q.name === name)) throw new Error(name + " already exists");
+    p = makePiece(name, { "art.txt": "" }, null);
+    p.grid = { w: g.w, h: g.h, ch: g.ch.slice(), fg: g.fg.slice(), bg: g.bg.slice() };
+    p.palette = res.mode === "image" || res.mode === "piece" ? res.pal.slice() : null;
+  }
+  // show it in the palette it was made for
+  S.view.palette = res.mode === "image" || res.mode === "piece" ? "piece" : res.mode; $("viewPalette").value = S.view.palette; prefs.save();
+  if (into === "replace") afterPieceChange(); else await joinPieces(p);
+  msg(`imported ${res.cols}×${res.rows} into ${p.name}` + (into === "replace" ? " (Ctrl+Z restores it)" : p.handle ? " (Save to write it)" : " (Download to keep it)"));
+  return p;
+}
+
+// The dialog
+const IMP = { im: null, gen: 0, result: null, timer: 0 };
+function impOptions() { return { width: Number($("impW").value) || 1, palette: $("impPal").value, chars: $("impChars").value }; }
+function impKey(o) { return JSON.stringify([o.width, o.palette, o.chars, S.cols, S.rows]); }
+
+async function openImporter(src) {
+  let im; try { im = await loadImage(src); } catch (e) { msg("can't read that image: " + e.message, true); return; }
+  if (IMP.im && IMP.im.url) URL.revokeObjectURL(IMP.im.url);
+  IMP.im = im; IMP.result = null;
+  const p = cur(), d = $("impDlg");
+  $("impName").textContent = `${im.name} · ${im.w}×${im.h}`;
+  $("impW").max = S.cols; $("impW").value = defaultWidth(im);
+  const pieceOpt = $("impPal").querySelector("[value=piece]"); pieceOpt.disabled = pieceOpt.hidden = !(p && p.palette);
+  if (pieceOpt.disabled && $("impPal").value === "piece") $("impPal").value = "image";
+  const repl = $("impInto").querySelector("[value=replace]"); repl.disabled = !p;
+  if (!p) $("impInto").value = "new";
+  if (!d.open) { d.returnValue = ""; d.showModal(); }
+  previewImport();
+}
+
+function scheduleImport(delay) { clearTimeout(IMP.timer); IMP.timer = setTimeout(previewImport, delay); }
+
+async function previewImport() {
+  if (!IMP.im) return;
+  const gen = ++IMP.gen, o = impOptions(), size = importSize(IMP.im, o.width);
+  $("impH").textContent = size.rows; $("impCap").textContent = size.capped;
+  $("impOk").disabled = true;
+  const slow = o.chars === "all" && size.cols > 80 ? " Every character is slow above 80 columns." : "";
+  $("impInfo").textContent = "working…" + slow;
+  try {
+    const res = await convertImage(IMP.im, o, pct => { if (gen === IMP.gen) $("impInfo").textContent = `working… ${pct}%` + slow; }, () => gen !== IMP.gen);
+    if (!res || gen !== IMP.gen) return;
+    res.key = impKey(o); IMP.result = res; drawImportPreview(res);
+    $("impInfo").textContent = `${res.cols}×${res.rows} cells, ${res.colours} colour${res.colours === 1 ? "" : "s"} used, ${(res.ms / 1000).toFixed(1)} s.` + slow;
+    $("impOk").disabled = false;
+  } catch (e) { if (gen === IMP.gen) $("impInfo").textContent = "can't import: " + e.message; }
+}
+
+function drawImportPreview(res) {
+  const F = S.font, cv = $("impCanvas"), g = res.grid, pal = res.pal.map(hexRgb);
+  cv.width = g.w * F.w; cv.height = g.h * F.h;
+  const ctx = cv.getContext("2d"), img = ctx.createImageData(cv.width, cv.height);
+  for (let r = 0; r < g.h; r++) for (let c = 0; c < g.w; c++) {
+    const i = r * g.w + c, ch = g.ch[i], gi = ch === " " ? F.map.get(32) : F.map.get(ch.codePointAt(0));
+    paintGlyph(img, F, gi === undefined ? null : F.glyphs[gi], pal[g.fg[i] >= 0 ? g.fg[i] : 7], pal[g.bg[i] >= 0 ? g.bg[i] : 0], r, c);
+  }
+  ctx.putImageData(img, 0, 0); zoomImportPreview();
+}
+function zoomImportPreview() {
+  const cv = $("impCanvas"), v = $("impZoom").value, box = $("impView");
+  const z = v !== "fit" ? Number(v) : Math.min(2, (box.clientWidth - 2) / cv.width, (window.innerHeight * 0.6 - 2) / cv.height);
+  cv.style.width = Math.floor(cv.width * z) + "px"; cv.style.height = Math.floor(cv.height * z) + "px";
+}
+
+async function finishImport() {
+  const d = $("impDlg"); IMP.gen++; clearTimeout(IMP.timer);
+  if (d.returnValue !== "ok" || !IMP.im) return;
+  try {
+    const o = impOptions(); let res = IMP.result && IMP.result.key === impKey(o) ? IMP.result : null;
+    if (!res) { msg("importing…"); res = await convertImage(IMP.im, o); }
+    const into = $("impInto").value; let name = "";
+    if (into === "new") { name = await askName("Name the imported piece", freeName(slugName(IMP.im.name))); if (!name) return; }
+    await applyImport(res, into, name);
+  } catch (e) { msg("import failed: " + e.message, true); }
+}
+
 // ------------------------------------------------------------ wiring
 function setSize(cols, rows) {
   S.cols = Math.max(20, Math.min(512, cols | 0)); S.rows = Math.max(5, Math.min(200, rows | 0));
@@ -835,6 +1185,12 @@ function bind() {
   $("pieceName").onchange = e => { S.idx = Number(e.target.value); afterPieceChange(); };
   $("prev").onclick = () => go(-1); $("next").onclick = () => go(1);
   $("newPiece").onclick = () => addPiece(null); $("dupPiece").onclick = () => addPiece(cur());
+  $("importImg").onclick = () => $("imgInput").click();
+  $("imgInput").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) openImporter(f); };
+  $("impPal").onchange = $("impChars").onchange = () => scheduleImport(0);
+  $("impW").oninput = () => scheduleImport(300);
+  $("impZoom").onchange = zoomImportPreview;
+  $("impDlg").addEventListener("close", finishImport);
   $("save").onclick = savePiece; $("zip").onclick = downloadZip;
   $("undo").onclick = undo; $("redo").onclick = redo;
   $("viewPalette").onchange = e => { S.view.palette = e.target.value; prefs.save(); renderAll(); };
@@ -873,7 +1229,8 @@ function bind() {
   document.addEventListener("keydown", onKey);
   document.addEventListener("dragover", e => e.preventDefault());
   document.addEventListener("drop", async e => {
-    e.preventDefault(); const items = [...e.dataTransfer.items];
+    e.preventDefault(); const items = [...e.dataTransfer.items], files = [...e.dataTransfer.files];
+    if (files.length === 1 && isImageFile(files[0])) { openImporter(files[0]); return; }
     if (items.length && items[0].getAsFileSystemHandle) { const h = await items[0].getAsFileSystemHandle(); if (h && h.kind === "directory") { await openDirHandle(h); return; } }
     openFileList([...e.dataTransfer.files]);
   });
@@ -883,6 +1240,7 @@ function onKey(e) {
   const t = e.target; const typingField = t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA");
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); savePiece(); return; }
+  if (document.querySelector("dialog[open]")) return;
   if (typingField) return;
   if (mod && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (mod && e.key.toLowerCase() === "y") { e.preventDefault(); redo(); return; }
@@ -914,6 +1272,16 @@ window.ttyskin = {
   load(pieces) { S.pieces = pieces.map(p => makePiece(p.name, p.files, null)); S.idx = S.pieces.length ? 0 : -1; S.root = null; S.readOnly = true; afterPieceChange(); },
   files() { const p = cur(); return p && pieceFiles(p); },
   openDir: openDirHandle, save: savePiece,
+  // source: a URL, a Blob or a data URL; options: { width, palette: "image"|"piece"|"linux"|"ubuntu", chars: "blocks"|"lines"|"all", into: "new"|"replace", name }
+  async importImage(source, options) {
+    const o = options || {}, im = await loadImage(source);
+    try {
+      const res = await convertImage(im, { width: o.width || defaultWidth(im), palette: o.palette || "image", chars: o.chars || "blocks" });
+      const into = o.into || "new";
+      await applyImport(res, into, into === "new" ? o.name || freeName(slugName(im.name)) : "");
+      return pieceFiles(cur());
+    } finally { if (im.url) URL.revokeObjectURL(im.url); }
+  },
   state: S,
 };
 

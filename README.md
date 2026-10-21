@@ -116,6 +116,17 @@ Open `ttyskin.html` in a browser. It works from disk with no server and no netwo
 - **Sample values:** what live values show as in the page (host name, addresses, OS, terminal, users), so rows with live values line up as they will on your machine.
 - **Font:** the page includes the common 8×16 console font. `ttyskin font export -o font.json` on a machine writes that machine's font for **Font…**.
 
+### Import an image
+
+**Import image…**, or dropping an image file on the page, turns a picture (PNG, JPEG, WebP, GIF, SVG) into a piece that the console shows exactly as previewed. Choose:
+
+- **Width** in columns; the height follows the picture's shape.
+- **Palette:** 16 colors taken from the image, the open piece's palette, or the Linux or Ubuntu default.
+- **Characters:** blocks, blocks and lines (better edges), or every character in the font (slow for large widths).
+- **Into:** a new piece, or replace the open piece (one undo brings it back).
+
+Transparent parts of the picture get no background color. The result is a normal piece: finish it with the brush and text tools.
+
 ## Uninstall
 
 ```sh
