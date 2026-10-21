@@ -48,7 +48,7 @@ aside h3:first-child { margin-top: 4px; }
 #brushChar { width: 46px; text-align: center; font-size: 16px; }
 #missing { color: var(--warn); white-space: pre-wrap; }
 .note { color: var(--dim); font-size: 12px; }
-.samples label { color: var(--dim); } .samples input { padding: 2px 6px; }
+.samples label { color: var(--dim); max-width: 100%; } .samples input { padding: 2px 6px; min-width: 0; max-width: 100%; }
 footer { display: flex; gap: 18px; padding: 4px 12px; background: var(--panel); border-top: 1px solid var(--line); color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; }
 footer #msg { color: var(--accent2); overflow: hidden; text-overflow: ellipsis; }
 footer #msg.err { color: var(--warn); }
@@ -133,7 +133,7 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-si
       <label title="{ipv4} and {ipv4:interface}">ipv4 <input id="smpIp" size="15"></label>
     </div>
     <div class="row samples">
-      <label title="per interface, like eth0=192.168.1.20, tailscale0=100.64.0.1">by interface <input id="smpIfs" size="24" placeholder="eth0=192.168.1.20"></label>
+      <label title="per interface, like eth0=192.168.1.20, tailscale0=100.64.0.1">per interface <input id="smpIfs" size="18" placeholder="eth0=192.168.1.20"></label>
     </div>
     <p class="note">What live values show as in this page, so rows line up as they will on your machine.</p>
 

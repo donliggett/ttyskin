@@ -116,6 +116,8 @@ pieces/sample/                   the sample piece
 tests/test_ttyskin.py            the command's tests (python3 -m unittest discover -s tests)
 docs/SPEC.md                     this file
 docs/GUIDE.md                    how to use the page and the command
+docs/screenshot.png              the README's picture of the page
+.github/workflows/pages.yml      publishes the page as a website on every push
 README.md                        what it does, install, use
 LICENSE                          MIT; the font's public-domain note
 ```

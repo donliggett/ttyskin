@@ -14,6 +14,10 @@ ttyskin puts color text art on the Linux login console: the text screen a machin
 - **`ttyskin`** installs a piece, removes it, and checks pieces against the console's font and size.
 - **`ttyskin.html`** shows pieces exactly as the console draws them, in the console's own bitmap font, and lets you edit them.
 
+**Try the page in your browser:** [ttyskin.donliggett.com](https://ttyskin.donliggett.com). It runs entirely in the browser; nothing is uploaded.
+
+![The ttyskin page showing the sample piece on an 80×25 console](docs/screenshot.png)
+
 ## How it works
 
 - The login prompt (`agetty`) prints `/etc/issue` and then every file in `/etc/issue.d/`. ttyskin writes one file there, `/etc/issue.d/ttyskin.issue`. It never edits `/etc/issue`.
