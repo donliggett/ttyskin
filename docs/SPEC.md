@@ -111,6 +111,7 @@ The output uses only `0`–`f` for text, `0`–`7` for backgrounds and character
 ttyskin                          the command (Python, one file)
 ttyskin.html                     the page (the font is embedded in it)
 fonts/Uni2-Fixed16.psf.gz        the font the page embeds; also used by the tests
+fonts/README.md                  where the font comes from; it is in the public domain
 systemd/ttyskin-palette.service  keeps the palette across reboots
 pieces/sample/                   the sample piece
 tests/test_ttyskin.py            the command's tests (python3 -m unittest discover -s tests)
@@ -119,7 +120,7 @@ docs/GUIDE.md                    how to use the page and the command
 docs/screenshot.png              the README's picture of the page
 .github/workflows/pages.yml      publishes the page as a website on every push
 README.md                        what it does, install, use
-LICENSE                          MIT; the font's public-domain note
+LICENSE                          MIT
 ```
 
 Install is a clone and a link: the clone in `/opt/ttyskin`, the command linked into `/usr/local/bin`, the unit copied to `/etc/systemd/system`. The README gives the exact commands.

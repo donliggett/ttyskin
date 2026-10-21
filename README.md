@@ -150,4 +150,4 @@ The tests run against a temporary folder standing in for `/` and change nothing 
 
 ## License
 
-MIT. The bundled console font comes from console-setup and is in the public domain; see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The bundled console font comes from console-setup and is in the public domain; see [fonts/README.md](fonts/README.md).

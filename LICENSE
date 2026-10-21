@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-fonts/Uni2-Fixed16.psf.gz, and the copy of it embedded in ttyskin.html, come
-from the console-setup package (Anton Zinoviev), whose copyright statement
-says: "All console fonts are public domain by nature."
